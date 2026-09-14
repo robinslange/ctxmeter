@@ -806,10 +806,10 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
     );
     println!("and less for every case whose control arm fails and never buys a second.");
 
-    let mut sessions: Vec<usize> = cases.iter().map(|c| c.session).collect();
-    sessions.sort_unstable();
-    sessions.dedup();
-    v.sessions = sessions.len();
+    // Sessions with at least one informative fact, not sessions with a case: the
+    // interval this bootstraps over must not overstate its independent units,
+    // and control reproduction at 1 in 7 makes the two counts very different.
+    let mut informative_sessions: HashSet<usize> = HashSet::new();
 
     for (i, c) in cases.iter().enumerate() {
         if show_raw {
@@ -844,7 +844,7 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
                 println!("  control graded {g:?} for {:?}", f.text);
             }
             if let Some(why) = unusable(&ctrl, g) {
-                println!("turn {i} fact unusable: {why}");
+                println!("turn {i} control arm unusable for fact {:?}: {why}", f.text);
                 v.unusable += 1;
                 continue;
             }
@@ -860,7 +860,6 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
         if live.is_empty() {
             continue;
         }
-        v.turns_informative += 1;
         let treat = match call(api_key, &c.model, &c.messages_masked, &c.tools) {
             Ok(r) => r,
             Err(e) => {
@@ -871,23 +870,32 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
         if show_raw {
             show("treatment (fact removed)", &treat);
         }
+        let before = v.informative;
         for f in live {
             let g = grade(&treat, f);
             if show_raw {
                 println!("  treatment graded {g:?} for {:?}", f.text);
             }
             if let Some(why) = unusable(&treat, g) {
-                println!("turn {i} fact unusable: {why}");
+                println!(
+                    "turn {i} treatment arm unusable for fact {:?}: {why}",
+                    f.text
+                );
                 v.unusable += 1;
                 continue;
             }
             v.informative += 1;
+            informative_sessions.insert(c.session);
             match g {
                 Outcome::Reproduced => v.reproduced += 1,
                 Outcome::Sought => v.sought += 1,
                 Outcome::Silent => v.silent += 1,
             }
         }
+        if v.informative > before {
+            v.turns_informative += 1;
+        }
+        v.sessions = informative_sessions.len();
     }
     v
 }

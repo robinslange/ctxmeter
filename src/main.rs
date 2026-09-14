@@ -380,8 +380,8 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
     println!("turns built       : {}", cases.len());
     println!("input tokens     : {toks} across both arms");
     println!("estimated spend  : ${cost:.2}  (published prices, checked 2026-09-14)");
-    println!("\neach case is two calls: the intact context as control, then the");
-    println!("policy applied. a case only counts if the control reproduces the fact.");
+    println!("\neach turn is at most two calls: the intact context as control, then the");
+    println!("policy applied. a fact only counts if the control arm reproduces it.");
 
     if a.dry_run {
         let mut models: Vec<(String, usize)> = Vec::new();
@@ -417,6 +417,10 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
             "\nall {} cases satisfy the request invariants.",
             cases.len()
         );
+        let mut sess: Vec<usize> = cases.iter().map(|c| c.session).collect();
+        sess.sort_unstable();
+        sess.dedup();
+        println!("{} turns across {} sessions.", cases.len(), sess.len());
         let (a, b) = counterfactual::estimate_tokens(&cases[0]);
         let facts: usize = cases.iter().map(|c| c.facts.len()).sum();
         println!(
