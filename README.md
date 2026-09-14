@@ -136,12 +136,19 @@ lives: an Opus-class case runs about five times a Sonnet-class one. As a rough
 guide on one corpus, 133 cases came to about $31.
 
 The estimate is approximate in both directions, and the run prints the measured
-count beside it. Cases are ordered so that consecutive control arms from the same
-session extend the previous prefix and read most of their context from cache, and
-the estimate models neither that discount nor the cache write that precedes it. It
-counts both arms of every case, while a case whose control arm fails never buys
-its second arm. Against it, token counts come from serialized length rather than
-the tokenizer: on the first measured case that ran 1.6x low.
+count beside it. Turns are selected to cover as many distinct sessions as the
+sample allows, because a retention figure bootstrapped from a sample concentrated
+in a handful of sessions cannot stand in for the corpus. When a sample is large
+enough to revisit a session, its turns are sent adjacently so a later control arm
+can extend an earlier one's cached prefix — but the two arms of one turn never
+share a prefix with each other, because the policy rewrites the earliest tool
+results and the two rebuilds diverge near the start. Below the corpus's session
+count, a run gets no cache reuse at all. The estimate prices every input token as
+a cache write, at 1.25x, and never at the 0.1x a genuine cache read would bill,
+so it is a ceiling and not the bill. It counts both arms of every case, while a
+case whose control arm fails never buys its second arm. Against it, token counts
+come from serialized length rather than the tokenizer: on the first measured
+case that ran 1.6x low.
 
 Before either paid call, both arms go to `/v1/messages/count_tokens`, which is
 free. It answers the only question worth answering first, which is whether the API

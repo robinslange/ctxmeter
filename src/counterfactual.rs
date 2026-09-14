@@ -470,6 +470,10 @@ pub fn build_cases(
             tools,
         });
     }
+    // Coverage picked which turns entered the sample; this only fixes the order
+    // they are sent in, so a session revisited inside a large sample dispatches
+    // its turns adjacently and the second extends the first's cached prefix.
+    out.sort_unstable_by_key(|c| (c.session, c.cut));
     out
 }
 
@@ -524,7 +528,8 @@ pub fn estimate_cost(cases: &[Case]) -> f64 {
     for c in cases {
         let (a, b) = estimate_tokens(c);
         let (inp, outp) = price(&c.model);
-        usd += (a + b) as f64 / 1e6 * inp;
+        // A cache write bills at 1.25x, and nothing in a run reads it back.
+        usd += (a + b) as f64 / 1e6 * inp * 1.25;
         usd += 2.0 * MAX_TOKENS as f64 / 1e6 * outp; // both arms, at the ceiling
     }
     usd
