@@ -346,6 +346,19 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
         return 1;
     }
 
+    let mut models: Vec<&str> = cases.iter().map(|c| c.model.as_str()).collect();
+    models.sort_unstable();
+    models.dedup();
+    if models.len() > 1 {
+        eprintln!("--model {:?} matched more than one model:", a.model);
+        for m in &models {
+            eprintln!("  {m}");
+        }
+        eprintln!("one retention figure over two of them conflates them, and they are");
+        eprintln!("priced differently. narrow the filter to one.");
+        return 2;
+    }
+
     let cost = counterfactual::estimate_cost(&cases);
     let toks: u64 = cases
         .iter()
