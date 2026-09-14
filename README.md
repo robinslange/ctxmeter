@@ -113,9 +113,14 @@ actually did.
 
 The intact arm is the control. If it fails to reproduce the fact, that probe
 cannot say anything about the policy, so it is discarded and the discard rate is
-printed. Of the cases that survive, the outcome splits three ways:
+printed. Of the cases that survive, the outcome splits four ways:
 
-- **Reproduced anyway.** The model did not need the context to get there.
+- **Reproduced anyway.** The model did not need the context to get there, and it
+  acted on the fact.
+- **Rewrote it into prose.** The fact came back inside text rather than inside an
+  action. Counted apart, because a document regenerated around a string is a
+  weaker reuse than acting on it, and on the first measured corpus this was the
+  only way a control arm ever reproduced anything.
 - **Went to fetch it.** It noticed something was missing. The healthy failure.
   Counted only when the next action names what produced the fact. Matching on the
   tool name instead would score most of a coding corpus as a re-fetch, since most

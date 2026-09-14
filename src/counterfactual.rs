@@ -39,8 +39,11 @@ fn price(model: &str) -> (f64, f64) {
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Outcome {
-    /// The fact came back in the model's own next action.
+    /// The fact came back inside an action the model took.
     Reproduced,
+    /// The fact came back in prose. Counted, and counted separately: a document
+    /// regenerated around a string is a weaker reuse than acting on it.
+    Regenerated,
     /// The model went to fetch it again. Healthy: it noticed something missing.
     Sought,
     /// Neither. The fact is gone and the model did not ask for it.
@@ -726,9 +729,16 @@ fn unusable(resp: &serde_json::Value, g: Outcome) -> Option<String> {
 
 fn grade(resp: &serde_json::Value, f: &Fact) -> Outcome {
     let blocks = action_blocks(resp);
+    let acted = blocks
+        .iter()
+        .filter(|b| b["type"] == "tool_use")
+        .any(|b| b["input"].to_string().contains(&f.text));
+    if acted {
+        return Outcome::Reproduced;
+    }
     let whole = serde_json::to_string(&blocks).unwrap_or_default();
     if whole.contains(&f.text) {
-        return Outcome::Reproduced;
+        return Outcome::Regenerated;
     }
     for b in blocks {
         // Seeking the fact means going back to what produced it. The tool name
@@ -754,6 +764,7 @@ pub struct Verdict {
     pub discarded: usize,
     pub unusable: usize,
     pub reproduced: usize,
+    pub regenerated: usize,
     pub sought: usize,
     pub silent: usize,
     /// Requests the API refused to accept, or that never left the machine. Kept
@@ -788,6 +799,7 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
         discarded: 0,
         unusable: 0,
         reproduced: 0,
+        regenerated: 0,
         sought: 0,
         silent: 0,
         errors: Vec::new(),
@@ -874,7 +886,7 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
                 v.unusable += 1;
                 continue;
             }
-            if g != Outcome::Reproduced {
+            if !matches!(g, Outcome::Reproduced | Outcome::Regenerated) {
                 v.discarded += 1;
                 continue;
             }
@@ -914,6 +926,7 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
             informative_sessions.insert(c.session);
             match g {
                 Outcome::Reproduced => v.reproduced += 1,
+                Outcome::Regenerated => v.regenerated += 1,
                 Outcome::Sought => v.sought += 1,
                 Outcome::Silent => v.silent += 1,
             }
@@ -1013,7 +1026,7 @@ mod tests {
         let got = resp(serde_json::json!([{"type": "text", "text": "let me check the config"}]));
         assert_ne!(grade(&got, &c), Outcome::Reproduced);
         let got = resp(serde_json::json!([{"type": "text", "text": "build a7f3c9e21b84 failed"}]));
-        assert_eq!(grade(&got, &c), Outcome::Reproduced);
+        assert_eq!(grade(&got, &c), Outcome::Regenerated);
     }
 
     /// Any tool that names the origin counts, because `cat` and `Read` fetch the
@@ -1035,6 +1048,23 @@ mod tests {
             {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/etc/hosts"}}
         ]));
         assert_eq!(grade(&same_tool_other_file, &c), Outcome::Silent);
+    }
+
+    /// A fact inside a tool call is the agent acting on it. A fact inside prose may
+    /// be a document being rewritten around it. Both are reproductions, and a figure
+    /// that cannot tell them apart hides which one it is made of.
+    #[test]
+    fn a_fact_in_prose_is_told_apart_from_a_fact_in_an_action() {
+        let f = fact();
+        let acted = resp(serde_json::json!([
+            {"type": "tool_use", "id": "t1", "name": "Bash",
+             "input": {"command": "grep a7f3c9e21b84 /home/dev/other.log"}}
+        ]));
+        assert_eq!(grade(&acted, &f), Outcome::Reproduced);
+        let written = resp(serde_json::json!([
+            {"type": "text", "text": "the failing build was a7f3c9e21b84, as reported"}
+        ]));
+        assert_eq!(grade(&written, &f), Outcome::Regenerated);
     }
 
     /// Reasoning is not an action. Counting a fact recalled inside a thinking
@@ -1067,7 +1097,7 @@ mod tests {
         let got = resp(serde_json::json!([
             {"type": "text", "text": "build a7f3c9e21b84 failed"}
         ]));
-        assert_eq!(grade(&got, &here), Outcome::Reproduced);
+        assert_eq!(grade(&got, &here), Outcome::Regenerated);
         assert_eq!(grade(&got, &gone), Outcome::Silent);
     }
 

@@ -495,6 +495,12 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
     );
     println!(
         "  {:<24}{:>8}{:>9}",
+        "rewrote it into prose",
+        v.regenerated,
+        p(v.regenerated)
+    );
+    println!(
+        "  {:<24}{:>8}{:>9}",
         "went to fetch it",
         v.sought,
         p(v.sought)
