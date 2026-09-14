@@ -754,6 +754,15 @@ fn grade(resp: &serde_json::Value, f: &Fact) -> Outcome {
     Outcome::Silent
 }
 
+/// A control arm is live if the fact came back at all — whether the model acted on
+/// it or only wrote it out. Both are reproductions and both make the fact worth
+/// testing under the policy; only the report tells them apart. This lives apart
+/// from `run` so a test can hold it, because `run` needs a key and a network and no
+/// test can reach the branch otherwise.
+fn is_live_control(g: Outcome) -> bool {
+    matches!(g, Outcome::Reproduced | Outcome::Regenerated)
+}
+
 pub struct Verdict {
     pub turns_attempted: usize,
     /// Turns where at least one fact's control arm reproduced it. The unit an
@@ -886,7 +895,7 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
                 v.unusable += 1;
                 continue;
             }
-            if !matches!(g, Outcome::Reproduced | Outcome::Regenerated) {
+            if !is_live_control(g) {
                 v.discarded += 1;
                 continue;
             }
@@ -1065,6 +1074,18 @@ mod tests {
             {"type": "text", "text": "the failing build was a7f3c9e21b84, as reported"}
         ]));
         assert_eq!(grade(&written, &f), Outcome::Regenerated);
+    }
+
+    /// On the first corpus this was measured against, prose was the only kind of
+    /// control reproduction that ever occurred. Narrowing this rule to `Reproduced`
+    /// would discard every informative fact while the run still looked clean, so the
+    /// rule is asserted here rather than left to the one caller a test cannot reach.
+    #[test]
+    fn a_prose_reproduction_still_counts_as_a_live_control() {
+        assert!(is_live_control(Outcome::Reproduced));
+        assert!(is_live_control(Outcome::Regenerated));
+        assert!(!is_live_control(Outcome::Sought));
+        assert!(!is_live_control(Outcome::Silent));
     }
 
     /// Reasoning is not an action. Counting a fact recalled inside a thinking
