@@ -204,6 +204,18 @@ fn rebuild(path: &Path, upto_msg: u32) -> Option<Rebuilt> {
             }
         }
     }
+    // A tool_use whose result was never recorded invalidates the whole request, not
+    // just the block, and the API rejects all of it. Drop the block and keep the
+    // rest of the turn, which is still what the agent did. A message left with no
+    // content goes with it.
+    for m in &mut msgs {
+        if let Some(arr) = m["content"].as_array_mut() {
+            arr.retain(|b| {
+                b["type"] != "tool_use" || b["id"].as_str().is_some_and(|i| have.contains(i))
+            });
+        }
+    }
+    msgs.retain(|m| m["content"].as_array().is_some_and(|a| !a.is_empty()));
     // The last message must be a user turn. A trailing assistant message is a
     // prefill, which these models reject outright, and it is also where a
     // tool_use whose result we cut lands. One condition covers both.
@@ -861,6 +873,26 @@ mod tests {
             }
         }
         assert!(built >= 3, "only {built} cut points rebuilt at all");
+    }
+
+    /// A call whose result was never recorded makes the whole request invalid, and
+    /// the API rejects the request rather than the block. The rest of the turn is
+    /// still what the agent did, so drop the block and keep the case.
+    #[test]
+    fn a_call_with_no_recorded_result_is_dropped_not_kept() {
+        let p = Path::new("tests/fixture/orphan-call.jsonl");
+        let (msgs, _, _) = rebuild(p, 9).expect("rebuildable");
+        assert_eq!(invalid(&msgs), None);
+        let whole = serde_json::to_string(&msgs).unwrap();
+        assert!(!whole.contains("\"lost\""), "the unanswered call survived");
+        assert!(
+            whole.contains("\"kept\""),
+            "the answered call was dropped too"
+        );
+        assert!(
+            whole.contains("looking"),
+            "text in the same message was lost"
+        );
     }
 
     fn resp(blocks: serde_json::Value) -> serde_json::Value {
