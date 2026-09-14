@@ -386,10 +386,10 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
     println!("input tokens     : {toks} across both arms");
     println!("spend ceiling    : ${cost:.2}  (published prices, checked 2026-09-14)");
     println!("\na ceiling, not an estimate, and it reads high: it bounds output at the");
-    println!("ceiling for two arms per turn against an observed mean near 985 tokens,");
-    println!("takes input from serialized length over 4 which runs about 1.5x low, and");
-    println!("buys 2 arms per turn where about 1.21 are bought, since a turn whose");
-    println!("control arm fails never buys its second.");
+    println!("ceiling for two arms per turn where a real turn produces a fraction of it,");
+    println!("and it buys both arms of every turn where a turn whose control arm fails");
+    println!("never buys its second. Against that, it takes input from serialized length");
+    println!("over 4, which undercounts. The run prints the measured count beside it.");
     println!("\neach turn is at most two calls: the intact context as control, then the");
     println!("policy applied. a fact only counts if the control arm reproduces it.");
 

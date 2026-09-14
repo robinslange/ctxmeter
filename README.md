@@ -139,13 +139,14 @@ reproduced the fact. The dry run prints the ceiling first, and spending requires
 
 A run covers one model family, because pooling two families into a single
 retention figure conflates them. That also happens to be where most of the cost
-lives: an Opus-class turn runs about two and a half times a Sonnet-5-class one,
-and about one and a half times a Sonnet-4-5-class one. As a rough guide, a dry
-run of 133 replayed turns on one corpus put its ceiling at about $31. That is
-the ceiling the tool prints and not a bill, and it reads roughly 3x high for the
-reasons below. The unit priced is the turn, not the fact: one replayed turn
-carries every fact the policy destroyed in it, and the dry run prints that ratio
-for your corpus.
+lives. Opus input costs two and a half times Sonnet-5 input per token, but the
+gap between two runs is wider than that, because the turns are not the same
+turns: on the author's corpus the same 133-turn sample priced at a $29.97 ceiling
+under `--model sonnet-5` and $99.29 under `--model opus-5`, about 3.3x, and the
+Opus sample carried 2.36 facts per turn against Sonnet's 1.90. Both figures are
+ceilings the tool printed, not bills. Price your own corpus; that is what the dry
+run is for. The unit priced is the turn, not the fact: one replayed turn carries
+every fact the policy destroyed in it, and the dry run prints that ratio.
 
 The ceiling is wrong in known directions, and the run prints the measured count
 beside it. Turns are selected to cover as many distinct sessions as the
@@ -157,10 +158,14 @@ share a prefix with each other, because the policy rewrites the earliest tool
 results and the two rebuilds diverge near the start. Below the corpus's session
 count, a run gets no cache reuse at all. The ceiling prices every input token as
 a cache write, at 1.25x, and never at the 0.1x a genuine cache read would bill.
-It bounds output at the ceiling for two arms of every turn, against an observed
-mean near 985 tokens, and buys both arms of every turn where about 1.21 are
-bought. Against all of that, token counts come from serialized length rather than
-the tokenizer, which runs about 1.5x low.
+It bounds output at the ceiling for two arms of every turn, where a real turn
+produces a fraction of that, and it buys both arms of every turn where a turn
+whose control arm fails never buys its second. Against all of that, token counts
+come from serialized length rather than the tokenizer, which undercounts. The
+magnitudes are corpus-specific and the first measured run put the whole product
+near 3x high, from five replies, eight control arms and two token counts on one
+corpus — too thin to quote at you as a correction factor. The run prints the
+measured count beside the ceiling so you can calibrate against your own.
 
 Before either paid call, both arms go to `/v1/messages/count_tokens`, which is
 free. It answers the only question worth answering first, which is whether the API
