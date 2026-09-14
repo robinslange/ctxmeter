@@ -44,6 +44,10 @@ pub struct Session {
     /// Content messages seen, used to exclude sessions too short to yield probes.
     pub msgs: usize,
     pub blocks: Vec<Block>,
+    /// One per billed assistant turn: (blocks preceding the request, real prefix tokens).
+    /// The real prefix includes the system prompt and tool definitions, which never
+    /// appear in a transcript, so cost must be grounded in it rather than estimated.
+    pub turns: Vec<(usize, u64)>,
     pub usage: Vec<Usage>,
 }
 
@@ -128,6 +132,8 @@ pub fn read_session(
     let mut seen_uuid: HashMap<String, ()> = HashMap::new();
     let mut blocks = Vec::new();
     let mut usage = Vec::new();
+    let mut turns: Vec<(usize, u64)> = Vec::new();
+    let mut fresh_usage: Option<u64> = None;
     let mut msgs_seen = 0usize;
     let mut tool_media: HashMap<String, bool> = HashMap::new();
     let mut buf = Vec::new();
@@ -146,6 +152,12 @@ pub fn read_session(
                 m.get("id").and_then(|v| v.as_str()).unwrap_or("")
             );
             if key != "|" && seen_req.insert(key) {
+                let g0 = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                fresh_usage = Some(
+                    g0("cache_read_input_tokens")
+                        + g0("cache_creation_input_tokens")
+                        + g0("input_tokens"),
+                );
                 let g = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
                 usage.push(Usage {
                     ts: d.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -183,6 +195,15 @@ pub fn read_session(
             }
             _ => continue,
         };
+
+        if role == Role::Assistant {
+            if let Some(real) = fresh_usage.take() {
+                if real > 0 {
+                    turns.push((blocks.len(), real));
+                }
+            }
+        }
+        fresh_usage = None;
 
         for b in items {
             let kind_s = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -259,6 +280,7 @@ pub fn read_session(
     Some(Session {
         msgs: msgs_seen,
         blocks,
+        turns,
         usage,
     })
 }

@@ -43,11 +43,16 @@ impl Policy {
 
 pub fn default_policies() -> Vec<Policy> {
     vec![
+        Policy::KeepLast(1),
         Policy::KeepLast(3),
+        Policy::KeepLast(5),
         Policy::KeepLast(10),
         Policy::KeepLast(25),
+        Policy::KeepLast(50),
+        Policy::TailBudget(10_000),
         Policy::TailBudget(40_000),
         Policy::TailBudget(100_000),
+        Policy::TailBudget(200_000),
     ]
 }
 
@@ -168,4 +173,67 @@ pub fn retention(sessions: &[&Session], probes: &[Vec<Probe>], pol: Policy) -> (
         }
     }
     (kept, total)
+}
+
+/// A masked tool result still costs its call header and a placeholder.
+const PLACEHOLDER: u32 = 25;
+const W: f64 = 1.25;
+const R: f64 = 0.10;
+
+/// Billed input cost under a policy, in base-input-token equivalents, grounded in
+/// the real prefix sizes from the usage records. The invisible remainder of each
+/// prefix (system prompt and tool definitions) is carried unchanged, because no
+/// context policy can touch it.
+pub fn billed_cost(sessions: &[&Session], pol: Option<Policy>) -> f64 {
+    let mut cost = 0.0;
+    for s in sessions {
+        let tr: Vec<usize> = s
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.kind == Kind::ToolResult)
+            .map(|(i, _)| i)
+            .collect();
+        let mut prev: Vec<(usize, u32)> = Vec::new();
+        for &(cut, real) in &s.turns {
+            let cut = cut.min(s.blocks.len());
+            let raw: u64 = s.blocks[..cut].iter().map(|b| b.tokens as u64).sum();
+            let invisible = real.saturating_sub(raw);
+
+            let live_end = tr.partition_point(|&i| i < cut);
+            let live = &tr[..live_end];
+            let from = pol.map(|p| p.survives_from(live, &s.blocks)).unwrap_or(0);
+            let masked: std::collections::HashSet<usize> =
+                live[..from.min(live.len())].iter().copied().collect();
+
+            let cur: Vec<(usize, u32)> = s.blocks[..cut]
+                .iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    let t = if masked.contains(&i) && b.tokens > PLACEHOLDER {
+                        PLACEHOLDER
+                    } else {
+                        b.tokens
+                    };
+                    (i, t)
+                })
+                .collect();
+
+            let mut shared: u64 = 0;
+            for (a, b) in cur.iter().zip(prev.iter()) {
+                if a == b {
+                    shared += a.1 as u64;
+                } else {
+                    break;
+                }
+            }
+            if !prev.is_empty() {
+                shared += invisible;
+            }
+            let total: u64 = cur.iter().map(|x| x.1 as u64).sum::<u64>() + invisible;
+            cost += R * shared as f64 + W * total.saturating_sub(shared) as f64;
+            prev = cur;
+        }
+    }
+    cost
 }

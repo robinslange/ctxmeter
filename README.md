@@ -11,6 +11,7 @@ cargo build --release
 ./target/release/ctxmeter floor        # system prompt + tool definitions, by month
 ./target/release/ctxmeter probes       # how much later-needed information each policy destroys
 ./target/release/ctxmeter sensitivity  # does the policy ranking survive widening the sample
+./target/release/ctxmeter tradeoff     # what each policy saves against what it destroys
 ```
 
 `ctxmeter.py` is kept as a reference implementation. The Rust binary is what you
@@ -131,6 +132,38 @@ substring containment.
 Full corpus, 2,485 sessions: 3.9s in Rust against 15.9s in Python. The reason to
 ship the Rust build is not speed, it is that replicating a finding should cost a
 stranger one command and no language runtime.
+
+## The tradeoff
+
+`tradeoff` reports both numbers from the same policy applied the same way. Cost is
+grounded in the real prefix sizes from the usage records, so the system prompt and
+tool definitions are carried unchanged: no context policy can touch them.
+
+| policy | cost saved | info retained |
+|---|---:|---:|
+| keep last 1 | +18.6% | 5.1% |
+| keep last 3 | +11.0% | 27.6% |
+| keep last 5 | +4.1% | 38.8% |
+| keep last 10 | -10.9% | 56.2% |
+| keep last 25 | -39.2% | 79.2% |
+| keep last 50 | -59.7% | 91.8% |
+| tail budget 10k | -9.0% | 53.0% |
+| tail budget 40k | -30.3% | 87.1% |
+| tail budget 100k | -8.8% | 97.9% |
+| tail budget 200k | +0.7% | 99.9% |
+
+Every policy that retains a meaningful amount of information costs **more** than
+doing nothing. The mechanism: once the mask boundary advances, the whole kept
+region is re-written at 1.25x instead of read at 0.10x, so the penalty is roughly
+how often it fires multiplied by how much it keeps. That product peaks in the
+middle, which is why 40k is worse than both 10k and 100k.
+
+Masking pays only at the extremes, keeping almost nothing or almost everything.
+A shipped default of keeping the last 3 tool results sits inside the only band
+where it saves money at all, and retains 27.6%.
+
+This is the mechanised form of Anthropic's own guidance for the context-editing
+beta: clear enough tokens to make the cache invalidation worthwhile.
 
 ## Privacy
 

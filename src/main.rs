@@ -2,7 +2,7 @@ mod probes;
 mod transcript;
 
 use clap::{Parser, Subcommand};
-use probes::{default_policies, eligible, harvest, retention};
+use probes::{billed_cost, default_policies, eligible, harvest, retention};
 use std::path::PathBuf;
 use transcript::{Interner, Session};
 
@@ -37,6 +37,13 @@ enum Cmd {
     },
     /// Widen the sample and check the policy ranking does not move.
     Sensitivity,
+    /// What each policy saves against what it destroys. The same knob does both.
+    Tradeoff {
+        #[arg(long, default_value_t = 3)]
+        max_df: usize,
+        #[arg(long, default_value_t = 5)]
+        min_gap: usize,
+    },
 }
 
 fn default_root() -> PathBuf {
@@ -251,6 +258,47 @@ fn allow_sigpipe() {
 #[cfg(not(unix))]
 fn allow_sigpipe() {}
 
+fn cmd_tradeoff(all: &[Session], max_df: usize, min_gap: usize) -> i32 {
+    let sessions = eligible(all);
+    let probes = harvest(&sessions, max_df, min_gap);
+    let n: usize = probes.iter().map(|v| v.len()).sum();
+    if n == 0 {
+        println!("NO PROBES HARVESTED; cannot report a tradeoff.");
+        return 1;
+    }
+    let base = billed_cost(&sessions, None);
+    println!(
+        "{} sessions, {} probes, baseline billed cost {:.0} equivalents\n",
+        sessions.len(),
+        n,
+        base
+    );
+    println!(
+        "{:<20}{:>12}{:>14}{:>14}",
+        "policy", "cost saved", "info retained", "info lost"
+    );
+    for pol in default_policies() {
+        let c = billed_cost(&sessions, Some(pol));
+        let (kept, total) = retention(&sessions, &probes, pol);
+        if total == 0 {
+            continue;
+        }
+        let r = kept as f64 / total as f64;
+        println!(
+            "{:<20}{:>11.1}%{:>13.1}%{:>13.1}%",
+            pol.label(),
+            (1.0 - c / base) * 100.0,
+            r * 100.0,
+            (1.0 - r) * 100.0
+        );
+    }
+    println!("\nboth columns come from the same policy applied the same way.");
+    println!("cost is grounded in real prefix sizes, so the system prompt and tool");
+    println!("definitions are carried unchanged: no context policy can touch them.");
+    println!("retention measures information survival, not task success.");
+    0
+}
+
 fn main() {
     allow_sigpipe();
     let cli = Cli::parse();
@@ -272,6 +320,7 @@ fn main() {
         }
         Cmd::Probes { max_df, min_gap } => cmd_probes(&sessions, max_df, min_gap),
         Cmd::Sensitivity => cmd_sensitivity(&sessions),
+        Cmd::Tradeoff { max_df, min_gap } => cmd_tradeoff(&sessions, max_df, min_gap),
     };
     std::process::exit(code);
 }
