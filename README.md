@@ -124,8 +124,17 @@ ctxmeter counterfactual --dry-run --sample 40   # builds and prices every reques
 ANTHROPIC_API_KEY=... ctxmeter counterfactual --sample 40 --yes
 ```
 
-Two calls per case at full session length, so this is not cheap. The dry run
+Two calls per case at full session length, so this is not free. The dry run
 prints the estimate first, and spending requires `--yes`.
+
+A run covers one model family, because pooling two families into a single
+retention figure conflates them. That also happens to be where most of the cost
+lives: an Opus-class case runs about five times a Sonnet-class one. As a rough
+guide on one corpus, 133 cases came to about $31.
+
+The printed estimate is an upper bound. Cases are ordered so that consecutive
+control arms from the same session extend the previous prefix and read most of
+their context from cache, and the estimate does not model that discount.
 
 It needs a real API key. It will not read a Claude subscription credential,
 because Anthropic's terms do not permit using Free, Pro or Max OAuth tokens in

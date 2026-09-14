@@ -56,6 +56,10 @@ enum Cmd {
         /// Tool results the policy keeps. 3 is a shipped default worth testing.
         #[arg(long, default_value_t = 3)]
         keep_last: usize,
+        /// Only use traces from models matching this substring. One family per
+        /// run: pooling two into one retention figure conflates them.
+        #[arg(long, default_value = "sonnet")]
+        model: String,
         #[arg(long, default_value_t = 40)]
         sample: usize,
         /// Build every request and price it, without calling the API.
@@ -302,6 +306,7 @@ fn cmd_sensitivity(all: &[Session]) -> i32 {
 
 struct CfArgs {
     keep_last: usize,
+    model: String,
     sample: usize,
     dry_run: bool,
     yes: bool,
@@ -323,6 +328,7 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
         names,
         pol,
         a.sample,
+        &a.model,
         &mut dropped,
     );
     if cases.is_empty() {
@@ -340,8 +346,10 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
         })
         .sum();
     println!("policy under test: {}", pol.label());
+    println!("model family    : {}", a.model);
     println!("probes considered: {}", dropped.considered);
     println!("  unrebuildable  : {}", dropped.unrebuildable);
+    println!("  other model    : {}", dropped.other_model);
     println!("  policy kept it : {}", dropped.policy_kept_the_fact);
     println!("cases built      : {}", cases.len());
     println!("input tokens     : {toks} across both arms");
@@ -576,6 +584,7 @@ fn main() {
         Cmd::Robustness { max_df, min_gap } => cmd_robustness(&sessions, max_df, min_gap),
         Cmd::Counterfactual {
             keep_last,
+            model,
             sample,
             dry_run,
             yes,
@@ -586,6 +595,7 @@ fn main() {
             &it.names,
             CfArgs {
                 keep_last,
+                model,
                 sample,
                 dry_run,
                 yes,

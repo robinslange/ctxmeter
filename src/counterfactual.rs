@@ -50,6 +50,7 @@ pub struct Dropped {
     pub considered: usize,
     pub unrebuildable: usize,
     pub policy_kept_the_fact: usize,
+    pub other_model: usize,
 }
 
 pub struct Case {
@@ -263,10 +264,22 @@ pub fn build_cases(
     interned: &[String],
     pol: Policy,
     sample: usize,
+    model_filter: &str,
     dropped: &mut Dropped,
 ) -> Vec<Case> {
     let mut flat: Vec<(usize, &Probe)> = Vec::new();
     for (si, ps) in probes.iter().enumerate() {
+        // Pooling two model families into one retention figure conflates them,
+        // so a run covers one family. It is also 5x cheaper.
+        let model_ok = sessions[si]
+            .usage
+            .first()
+            .map(|u| u.model.contains(model_filter))
+            .unwrap_or(false);
+        if !model_ok {
+            dropped.other_model += ps.len();
+            continue;
+        }
         for p in ps {
             flat.push((si, p));
         }
@@ -275,7 +288,7 @@ pub fn build_cases(
     flat.sort_by_key(|(si, p)| (p.use_at, *si));
     let step = (flat.len() / sample.max(1)).max(1);
 
-    let mut out = Vec::new();
+    let mut out: Vec<(usize, usize, Case)> = Vec::new();
     for (si, p) in flat.into_iter().step_by(step) {
         if out.len() >= sample {
             break;
@@ -322,17 +335,24 @@ pub fn build_cases(
             .first()
             .map(|u| u.model.clone())
             .unwrap_or_else(|| "claude-sonnet-5".into());
-        out.push(Case {
-            fact,
-            model,
-            origin_tool: otool,
-            origin_target: otarget,
-            messages_intact: intact,
-            messages_masked: masked,
-            tools,
-        });
+        out.push((
+            si,
+            intact.len(),
+            Case {
+                fact,
+                model,
+                origin_tool: otool,
+                origin_target: otarget,
+                messages_intact: intact,
+                messages_masked: masked,
+                tools,
+            },
+        ));
     }
-    out
+    // Group by session and order by growing prefix, so each control arm extends
+    // the one before it and reads most of its context from cache.
+    out.sort_by_key(|(si, len, _)| (*si, *len));
+    out.into_iter().map(|(_, _, c)| c).collect()
 }
 
 pub fn estimate_tokens(c: &Case) -> (u64, u64) {
@@ -367,9 +387,21 @@ fn call(
     msgs: &[serde_json::Value],
     tools: &[serde_json::Value],
 ) -> Option<serde_json::Value> {
+    // The next action is short. 1024 bought nothing and output is billed at 5x.
+    let mut msgs = msgs.to_vec();
+    // Mark the prefix cacheable. Cases are ordered so that consecutive control
+    // arms from one session extend the previous prefix, which then reads at 0.1x
+    // instead of being re-sent at full price.
+    if let Some(last) = msgs.last_mut() {
+        if let Some(arr) = last["content"].as_array_mut() {
+            if let Some(b) = arr.last_mut() {
+                b["cache_control"] = serde_json::json!({"type": "ephemeral"});
+            }
+        }
+    }
     let body = serde_json::json!({
         "model": model,
-        "max_tokens": 1024,
+        "max_tokens": 512,
         "temperature": 0,
         "system": "You are continuing an agent session. Produce only the next action you \
                    would take, in the same style as the transcript so far.",
