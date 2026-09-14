@@ -64,6 +64,13 @@ enum Cmd {
         /// the same turn are scored against its one response, not re-requested.
         #[arg(long, default_value_t = 40)]
         sample: usize,
+        /// Built turns to pass over before the sample starts. Selection is
+        /// deterministic over a given corpus, so without it a smaller sample
+        /// replays the first turns of a larger one. The order moves as transcripts
+        /// are added, so a skip lines up with an earlier run only over the same
+        /// corpus.
+        #[arg(long, default_value_t = 0)]
+        skip: usize,
         /// Build every request and price it, without calling the API.
         #[arg(long)]
         dry_run: bool,
@@ -377,6 +384,7 @@ struct CfArgs {
     keep_last: usize,
     model: String,
     sample: usize,
+    skip: usize,
     dry_run: bool,
     yes: bool,
     preflight: bool,
@@ -388,11 +396,12 @@ struct CfArgs {
 /// What the selection lost, and where each denominator comes from. `other model`
 /// is counted over the whole corpus before any turn is visited, so it is not a
 /// component of `facts considered` and is not printed as one.
-fn print_drops(d: &counterfactual::Dropped, built: usize) {
+fn print_drops(d: &counterfactual::Dropped, skip: usize, built: usize) {
     println!(
         "facts on another model, corpus-wide: {} (excluded before selection)",
         d.other_model
     );
+    println!("turns skipped     : {skip} (built, then passed over; not counted below)");
     println!("turns considered  : {}", d.turns_considered);
     println!("  unrebuildable   : {}", d.unrebuildable);
     println!("facts considered  : {}", d.considered);
@@ -415,10 +424,10 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
         paths: &paths,
         interned: names,
     };
-    let cases = counterfactual::build_cases(&corpus, pol, a.sample, &a.model, &mut dropped);
+    let cases = counterfactual::build_cases(&corpus, pol, a.sample, a.skip, &a.model, &mut dropped);
     if cases.is_empty() {
         println!("No usable turns.");
-        print_drops(&dropped, cases.len());
+        print_drops(&dropped, a.skip, cases.len());
         return 1;
     }
 
@@ -445,7 +454,7 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
         .sum();
     println!("policy under test: {}", pol.label());
     println!("model family    : {}", a.model);
-    print_drops(&dropped, cases.len());
+    print_drops(&dropped, a.skip, cases.len());
     println!("input tokens     : {toks} across both arms");
     println!("spend ceiling    : ${cost:.2}  (published prices, checked 2026-09-14)");
     println!("\na ceiling, not an estimate, and it reads high: it bounds output at the");
@@ -783,6 +792,7 @@ fn main() {
             keep_last,
             model,
             sample,
+            skip,
             dry_run,
             yes,
             preflight,
@@ -796,6 +806,7 @@ fn main() {
                 keep_last,
                 model,
                 sample,
+                skip,
                 dry_run,
                 yes,
                 preflight,

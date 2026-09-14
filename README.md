@@ -137,6 +137,14 @@ control arm, then the treatment arm, which is only bought if the control
 reproduced the fact. The dry run prints the ceiling first, and spending requires
 `--yes`.
 
+Selection is deterministic over a given corpus, so a smaller sample is the first
+turns of a larger one: `--sample 5` replays five turns an earlier `--sample 25`
+already bought. `--skip N` passes over the first N turns the order builds and
+samples after them. The order moves as transcripts are added, so a skip lines up
+with an earlier run only over the same corpus; on the author's corpus it moved
+two positions in a day. The selection counts in the header describe only the
+turns after the skip.
+
 A run covers one model family, because pooling two families into a single
 retention figure conflates them. That also happens to be where most of the cost
 lives. Opus input costs two and a half times Sonnet-5 input per token, but the

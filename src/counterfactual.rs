@@ -446,6 +446,7 @@ pub fn build_cases(
     c: &Corpus,
     pol: Policy,
     sample: usize,
+    skip: usize,
     model_filter: &str,
     dropped: &mut Dropped,
 ) -> Vec<Case> {
@@ -478,20 +479,14 @@ pub fn build_cases(
         }
     }
     let keys: Vec<(usize, u32)> = turns.keys().copied().collect();
-    let order = round_robin(&keys);
-
-    let mut out: Vec<Case> = Vec::new();
-    for (si, cut) in order {
-        if out.len() >= sample {
-            break;
-        }
+    let build = |si: usize, cut: u32, dropped: &mut Dropped| -> Option<Case> {
         let ps = &turns[&(si, cut)];
         dropped.turns_considered += 1;
         dropped.considered += ps.len();
         let path = Path::new(&paths[si]);
         let Some((intact, tools, origin)) = rebuild(path, cut) else {
             dropped.unrebuildable += 1;
-            continue;
+            return None;
         };
         let masked = apply_mask(&intact, &pol);
         let mut facts: Vec<Fact> = Vec::new();
@@ -534,14 +529,14 @@ pub fn build_cases(
             });
         }
         if facts.is_empty() {
-            continue;
+            return None;
         }
         let model = sessions[si]
             .usage
             .first()
             .map(|u| u.model.clone())
             .unwrap_or_else(|| "claude-sonnet-5".into());
-        out.push(Case {
+        Some(Case {
             session: si,
             cut,
             model,
@@ -549,8 +544,21 @@ pub fn build_cases(
             messages_intact: intact,
             messages_masked: masked,
             tools,
-        });
-    }
+        })
+    };
+
+    // Skipped turns are built so that "skip n" means the n turns an earlier run
+    // replayed, and counted into a scratch ledger so the header describes this run.
+    let mut order = round_robin(&keys).into_iter();
+    order
+        .by_ref()
+        .filter_map(|(si, cut)| build(si, cut, &mut Dropped::default()))
+        .take(skip)
+        .for_each(drop);
+    let mut out: Vec<Case> = order
+        .filter_map(|(si, cut)| build(si, cut, dropped))
+        .take(sample)
+        .collect();
     // Coverage picked which turns entered the sample; this only fixes the order
     // they are sent in, so a session revisited inside a large sample dispatches
     // its turns adjacently and the second extends the first's cached prefix.
@@ -1101,6 +1109,49 @@ mod tests {
         serde_json::json!({"stop_reason": "end_turn", "content": blocks})
     }
 
+    /// Two probes reused at message 7, one at message 5. Both tokens sit in the
+    /// tool_result the policy masks at either cut, and the call that produced them
+    /// named a file, so all three are usable facts over two turns.
+    fn two_turns() -> (Session, [String; 3], Vec<Vec<Probe>>) {
+        use crate::transcript::{Block, Kind, Role, Usage};
+        let block = |msg: u32| Block {
+            msg,
+            kind: Kind::ToolResult,
+            role: Role::Assistant,
+            tokens: 0,
+            toks: vec![],
+        };
+        let session = Session {
+            path: "tests/fixture/session.jsonl".into(),
+            msgs: 8,
+            blocks: vec![block(7), block(7), block(5)],
+            turns: vec![],
+            usage: vec![Usage {
+                ts: "2026-09-01T10:00:01Z".into(),
+                model: "claude-sonnet-5".into(),
+                read: 0,
+                write: 0,
+                fresh: 0,
+                out: 0,
+            }],
+        };
+        let interned = [
+            "a7f3c9e21b84".to_string(),
+            "5c1e8b73d940e2".to_string(),
+            "unused".to_string(),
+        ];
+        let probe = |tok, use_at| Probe {
+            tok,
+            origin: 0,
+            use_at,
+        };
+        (
+            session,
+            interned,
+            vec![vec![probe(0, 0), probe(1, 1), probe(0, 2)]],
+        )
+    }
+
     /// Two facts reused in one assistant turn are one replayed request, not two.
     /// Issuing two would draw two independent samples of a non-deterministic
     /// response and could return contradictory verdicts for the same context.
@@ -1110,54 +1161,7 @@ mod tests {
     /// three here.
     #[test]
     fn facts_reused_in_one_turn_become_one_case() {
-        use crate::transcript::{Block, Kind, Role, Usage};
-        let block = |msg: u32| Block {
-            msg,
-            kind: Kind::ToolResult,
-            role: Role::Assistant,
-            tokens: 0,
-            toks: vec![],
-        };
-        let usage = |model: &str| Usage {
-            ts: "2026-09-01T10:00:01Z".into(),
-            model: model.into(),
-            read: 0,
-            write: 0,
-            fresh: 0,
-            out: 0,
-        };
-        // Two probes reused at message 7, one at message 5. Both tokens sit in the
-        // tool_result the policy masks at either cut, and the call that produced
-        // them named a file, so all three are usable facts.
-        let session = Session {
-            path: "tests/fixture/session.jsonl".into(),
-            msgs: 8,
-            blocks: vec![block(7), block(7), block(5)],
-            turns: vec![],
-            usage: vec![usage("claude-sonnet-5")],
-        };
-        let interned = [
-            "a7f3c9e21b84".to_string(),
-            "5c1e8b73d940e2".to_string(),
-            "unused".to_string(),
-        ];
-        let probes = vec![vec![
-            Probe {
-                tok: 0,
-                origin: 0,
-                use_at: 0,
-            },
-            Probe {
-                tok: 1,
-                origin: 0,
-                use_at: 1,
-            },
-            Probe {
-                tok: 0,
-                origin: 0,
-                use_at: 2,
-            },
-        ]];
+        let (session, interned, probes) = two_turns();
         let sessions = [&session];
         let paths = [session.path.clone()];
         let corpus = Corpus {
@@ -1167,7 +1171,14 @@ mod tests {
             interned: &interned,
         };
         let mut dropped = Dropped::default();
-        let cases = build_cases(&corpus, Policy::KeepLast(1), 10, "sonnet-5", &mut dropped);
+        let cases = build_cases(
+            &corpus,
+            Policy::KeepLast(1),
+            10,
+            0,
+            "sonnet-5",
+            &mut dropped,
+        );
         assert_eq!(cases.len(), 2, "one case per turn, not one per fact");
         let shared = cases.iter().find(|c| c.cut == 7).expect("the shared turn");
         assert_eq!(
@@ -1181,6 +1192,36 @@ mod tests {
         assert!(!shared.messages_intact.is_empty(), "nothing was rebuilt");
         let other = cases.iter().find(|c| c.cut == 5).expect("the other turn");
         assert_eq!(other.facts.len(), 1, "a different turn is a different case");
+    }
+
+    /// Selection is deterministic, so without a skip a small sample can only replay
+    /// the first turns a larger run already bought. Skipping passes over built
+    /// cases, not candidate turns, and the turns it passes over stay out of the
+    /// selection counts, which describe the run that is sent.
+    #[test]
+    fn skip_passes_over_built_cases_and_their_counts() {
+        let (session, interned, probes) = two_turns();
+        let sessions = [&session];
+        let paths = [session.path.clone()];
+        let corpus = Corpus {
+            sessions: &sessions,
+            probes: &probes,
+            paths: &paths,
+            interned: &interned,
+        };
+        let mut dropped = Dropped::default();
+        let cases = build_cases(
+            &corpus,
+            Policy::KeepLast(1),
+            10,
+            1,
+            "sonnet-5",
+            &mut dropped,
+        );
+        assert_eq!(cases.len(), 1, "one of two turns was skipped");
+        assert_eq!(cases[0].cut, 7, "the skip took the first turn in order");
+        assert_eq!(dropped.turns_considered, 1, "a skipped turn was counted");
+        assert_eq!(dropped.considered, 2, "a skipped turn's facts were counted");
     }
 
     /// `grep -n` output is a probe token that carries its own file path, so the
@@ -1226,7 +1267,14 @@ mod tests {
             interned: &interned,
         };
         let mut dropped = Dropped::default();
-        let cases = build_cases(&corpus, Policy::KeepLast(1), 10, "sonnet-5", &mut dropped);
+        let cases = build_cases(
+            &corpus,
+            Policy::KeepLast(1),
+            10,
+            0,
+            "sonnet-5",
+            &mut dropped,
+        );
         assert_eq!(dropped.fact_is_its_origin, 1);
         assert!(cases.is_empty(), "a fact whose buckets nest was graded");
     }
@@ -1274,7 +1322,14 @@ mod tests {
             interned: &interned,
         };
         let mut dropped = Dropped::default();
-        let cases = build_cases(&corpus, Policy::KeepLast(1), 10, "sonnet-5", &mut dropped);
+        let cases = build_cases(
+            &corpus,
+            Policy::KeepLast(1),
+            10,
+            0,
+            "sonnet-5",
+            &mut dropped,
+        );
         assert!(cases.is_empty(), "replayed an Opus turn as a Sonnet one");
         assert_eq!(dropped.other_model, 1);
     }
