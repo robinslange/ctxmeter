@@ -891,7 +891,9 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
                 println!("  control graded {g:?} for {:?}", f.text);
             }
             if let Some(why) = unusable(&ctrl, g) {
-                println!("turn {i} control arm unusable for fact {:?}: {why}", f.text);
+                // A probe token can carry a credential or a client path, so it is
+                // named only under --show-raw, which the line above already did.
+                println!("turn {i} control arm unusable for one fact: {why}");
                 v.unusable += 1;
                 continue;
             }
@@ -924,10 +926,7 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
                 println!("  treatment graded {g:?} for {:?}", f.text);
             }
             if let Some(why) = unusable(&treat, g) {
-                println!(
-                    "turn {i} treatment arm unusable for fact {:?}: {why}",
-                    f.text
-                );
+                println!("turn {i} treatment arm unusable for one fact: {why}");
                 v.unusable += 1;
                 continue;
             }
@@ -1140,7 +1139,7 @@ mod tests {
 
     /// A command is not a target. Every Bash-derived case would be ungradeable
     /// for seeking if it were, because the bucket could never be reached.
-    /// Shaped after a real measured case, with the paths replaced: a probe token
+    /// Shaped after a real measured case, with every path invented: a probe token
     /// or a path out of someone's trace does not belong in this repository. The
     /// directory is the longer path, and taking it would score every command in
     /// that project as a re-fetch. The test file is the artifact.
@@ -1149,9 +1148,9 @@ mod tests {
         assert_eq!(
             file_in(
                 "cd /home/dev/monorepo/apps/checkout && pnpm test \
-                 worker/routes/plans.tenant.test.ts 2>&1 | tail -40"
+                 worker/routes/billing.v2.test.ts 2>&1 | tail -40"
             ),
-            Some("worker/routes/plans.tenant.test.ts".into())
+            Some("worker/routes/billing.v2.test.ts".into())
         );
         // Names no file, so it yields no target and the case is dropped.
         assert_eq!(file_in("cd /home/dev/monorepo/notes && ls"), None);

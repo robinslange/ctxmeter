@@ -412,11 +412,12 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
         if bad > 0 {
             println!("\n{bad} arm(s) would be rejected by the API. Counting them all rather");
             println!("than stopping at the first: one is a bug, and the rate is the news.");
+        } else {
+            println!(
+                "\nall {} cases satisfy the request invariants.",
+                cases.len()
+            );
         }
-        println!(
-            "\nall {} cases satisfy the request invariants.",
-            cases.len()
-        );
         let mut sess: Vec<usize> = cases.iter().map(|c| c.session).collect();
         sess.sort_unstable();
         sess.dedup();
@@ -434,7 +435,7 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
             cases[0].facts.len()
         );
         println!("\ndry run: nothing was sent.");
-        return 0;
+        return i32::from(bad > 0);
     }
 
     let key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
