@@ -13,7 +13,11 @@ cargo build --release
 ./target/release/ctxmeter sensitivity  # does the policy ranking survive widening the sample
 ./target/release/ctxmeter tradeoff     # what each policy saves against what it destroys
 ./target/release/ctxmeter robustness   # does the conclusion survive its own assumptions
+./target/release/ctxmeter counterfactual --dry-run   # does a lost fact change what the agent does
 ```
+
+Everything except `counterfactual` is offline. Prebuilt binaries for macOS and
+Linux are attached to each release.
 
 `ctxmeter.py` is kept as a reference implementation. The Rust binary is what you
 distribute; the Python is what you check it against.
@@ -165,6 +169,50 @@ rows.
 
 This is the mechanised form of Anthropic's own guidance for the context-editing
 beta: clear enough tokens to make the cache invalidation worthwhile.
+
+## Tier two: does a lost fact change what the agent does?
+
+Retention measures whether information survived. It does not measure whether
+losing it mattered. `counterfactual` measures the second thing without asking a
+model to grade itself.
+
+At the block where the agent reused a fact, it had already produced that fact
+from that context. So replay that exact turn twice, once with the context intact
+and once with the policy applied, and check whether the literal string comes
+back. The task is the agent's own next action; the ground truth is what it
+actually did.
+
+The intact arm is the control. If it fails to reproduce the fact, the probe
+cannot say anything about the policy, so it is discarded and the discard rate is
+printed. Of the cases that survive, the outcome splits three ways:
+
+- **Reproduced anyway.** The model did not need the context to get there.
+- **Went to fetch it.** It noticed something was missing. The healthy failure.
+- **Neither.** The fact was gone and the model did not ask for it. This is the
+  irreversible share.
+
+```bash
+ctxmeter counterfactual --dry-run --sample 40    # builds and prices every request, sends nothing
+ANTHROPIC_API_KEY=... ctxmeter counterfactual --sample 40 --yes
+```
+
+Two calls per case at full session length, so it is not cheap. The dry run prints
+the estimate before you spend anything, and spending needs `--yes`.
+
+It requires a real API key and will not read a Claude subscription credential,
+because Anthropic's terms do not permit using Free, Pro or Max OAuth tokens in
+another tool. If you keep keys in 1Password, pass it without writing it to disk:
+
+```bash
+ANTHROPIC_API_KEY="$(op read 'op://YourVault/Anthropic/credential')" \
+  ctxmeter counterfactual --sample 40 --yes
+```
+
+Known limits of the rebuild: the system prompt and the real tool definitions are
+not recorded in a transcript, so tool schemas are synthesised from the calls the
+session actually made and are permissive. Thinking blocks are dropped, since
+their signatures will not validate in a fresh request. Both make this an
+approximation of the original turn, not a replay of it.
 
 ## Robustness, and what this does not establish
 
