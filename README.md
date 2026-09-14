@@ -132,28 +132,35 @@ ctxmeter counterfactual --dry-run --sample 40   # builds and prices every reques
 ANTHROPIC_API_KEY=... ctxmeter counterfactual --sample 40 --yes
 ```
 
-Two calls per case at full session length, so this is not free. The dry run
-prints the estimate first, and spending requires `--yes`.
+At most two calls per turn at full session length, so this is not free: the
+control arm, then the treatment arm, which is only bought if the control
+reproduced the fact. The dry run prints the ceiling first, and spending requires
+`--yes`.
 
 A run covers one model family, because pooling two families into a single
 retention figure conflates them. That also happens to be where most of the cost
-lives: an Opus-class case runs about five times a Sonnet-class one. As a rough
-guide on one corpus, 133 cases came to about $31.
+lives: an Opus-class turn runs about two and a half times a Sonnet-5-class one,
+and about one and a half times a Sonnet-4-5-class one. As a rough guide, a dry
+run of 133 replayed turns on one corpus put its ceiling at about $31. That is
+the ceiling the tool prints and not a bill, and it reads roughly 3x high for the
+reasons below. The unit priced is the turn, not the fact: one replayed turn
+carries every fact the policy destroyed in it, and the dry run prints that ratio
+for your corpus.
 
-The estimate is approximate in both directions, and the run prints the measured
-count beside it. Turns are selected to cover as many distinct sessions as the
+The ceiling is wrong in known directions, and the run prints the measured count
+beside it. Turns are selected to cover as many distinct sessions as the
 sample allows, because a retention figure bootstrapped from a sample concentrated
 in a handful of sessions cannot stand in for the corpus. When a sample is large
 enough to revisit a session, its turns are sent adjacently so a later control arm
 can extend an earlier one's cached prefix — but the two arms of one turn never
 share a prefix with each other, because the policy rewrites the earliest tool
 results and the two rebuilds diverge near the start. Below the corpus's session
-count, a run gets no cache reuse at all. The estimate prices every input token as
-a cache write, at 1.25x, and never at the 0.1x a genuine cache read would bill,
-so it is a ceiling and not the bill. It counts both arms of every case, while a
-case whose control arm fails never buys its second arm. Against it, token counts
-come from serialized length rather than the tokenizer: on the first measured
-case that ran 1.6x low.
+count, a run gets no cache reuse at all. The ceiling prices every input token as
+a cache write, at 1.25x, and never at the 0.1x a genuine cache read would bill.
+It bounds output at the ceiling for two arms of every turn, against an observed
+mean near 985 tokens, and buys both arms of every turn where about 1.21 are
+bought. Against all of that, token counts come from serialized length rather than
+the tokenizer, which runs about 1.5x low.
 
 Before either paid call, both arms go to `/v1/messages/count_tokens`, which is
 free. It answers the only question worth answering first, which is whether the API
@@ -195,7 +202,16 @@ than a blog post you have to believe.
 Known limits of the tier-two rebuild: the system prompt and real tool schemas are
 not recorded in a transcript, so schemas are synthesised from the calls a session
 actually made and are permissive. Thinking blocks are dropped, because their
-signatures will not validate in a fresh request.
+signatures will not validate in a fresh request. Tier two sizes a tool result as
+serialized length over 4 with no image scaling, while the retention tables size
+the same block with the scaled estimator, so a `tail_budget_*` policy masks a
+different set of results than the table reports — about 2.85x off on an
+image-bearing one, which moves the budget boundary. `keep_last_*` counts results
+rather than tokens and is unaffected. And turns are spread across distinct
+sessions, but session order comes from an unsorted filesystem walk over one
+directory per project, so a sample smaller than the corpus's session count is the
+first N sessions that walk returned: many sessions, possibly drawn from few
+projects.
 
 ## How it avoids the usual measurement mistakes
 
