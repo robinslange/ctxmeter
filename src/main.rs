@@ -60,6 +60,8 @@ enum Cmd {
         /// run: pooling two into one retention figure conflates them.
         #[arg(long, default_value = "sonnet")]
         model: String,
+        /// Turns to replay. A turn is one observation; several facts destroyed in
+        /// the same turn are scored against its one response, not re-requested.
         #[arg(long, default_value_t = 40)]
         sample: usize,
         /// Build every request and price it, without calling the API.
@@ -335,14 +337,14 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
     };
     let cases = counterfactual::build_cases(&corpus, pol, a.sample, &a.model, &mut dropped);
     if cases.is_empty() {
-        println!(
-            "No usable cases, out of {} probes considered:",
-            dropped.considered
-        );
-        println!("  unrebuildable  : {}", dropped.unrebuildable);
-        println!("  other model    : {}", dropped.other_model);
-        println!("  policy kept it : {}", dropped.policy_kept_the_fact);
-        println!("  no re-fetch tgt: {}", dropped.no_refetch_target);
+        println!("No usable turns.");
+        println!("turns considered  : {}", dropped.turns_considered);
+        println!("  unrebuildable   : {}", dropped.unrebuildable);
+        println!("facts considered  : {}", dropped.considered);
+        println!("  policy kept it  : {}", dropped.policy_kept_the_fact);
+        println!("  no re-fetch tgt : {}", dropped.no_refetch_target);
+        println!("  other model     : {}", dropped.other_model);
+        println!("turns built       : {}", cases.len());
         return 1;
     }
 
@@ -369,12 +371,13 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
         .sum();
     println!("policy under test: {}", pol.label());
     println!("model family    : {}", a.model);
-    println!("probes considered: {}", dropped.considered);
-    println!("  unrebuildable  : {}", dropped.unrebuildable);
-    println!("  other model    : {}", dropped.other_model);
-    println!("  policy kept it : {}", dropped.policy_kept_the_fact);
-    println!("  no re-fetch tgt: {}", dropped.no_refetch_target);
-    println!("cases built      : {}", cases.len());
+    println!("turns considered  : {}", dropped.turns_considered);
+    println!("  unrebuildable   : {}", dropped.unrebuildable);
+    println!("facts considered  : {}", dropped.considered);
+    println!("  policy kept it  : {}", dropped.policy_kept_the_fact);
+    println!("  no re-fetch tgt : {}", dropped.no_refetch_target);
+    println!("  other model     : {}", dropped.other_model);
+    println!("turns built       : {}", cases.len());
     println!("input tokens     : {toks} across both arms");
     println!("estimated spend  : ${cost:.2}  (published prices, checked 2026-09-14)");
     println!("\neach case is two calls: the intact context as control, then the");
@@ -414,33 +417,17 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
             "\nall {} cases satisfy the request invariants.",
             cases.len()
         );
-        let mut turns: Vec<(usize, u32)> = cases.iter().map(|c| (c.session, c.cut)).collect();
-        turns.sort_unstable();
-        turns.dedup();
-        let mut sess: Vec<usize> = cases.iter().map(|c| c.session).collect();
-        sess.sort_unstable();
-        sess.dedup();
-        println!(
-            "{} cases over {} distinct replayed turns in {} sessions.",
-            cases.len(),
-            turns.len(),
-            sess.len()
-        );
-        if turns.len() < cases.len() {
-            println!(
-                "cases sharing a turn share a request: one observation scored more than once."
-            );
-        }
         let (a, b) = counterfactual::estimate_tokens(&cases[0]);
+        let facts: usize = cases.iter().map(|c| c.facts.len()).sum();
         println!(
-            "\nfirst case: {} messages intact ({a} tok), masked ({b} tok)",
-            cases[0].messages_intact.len()
+            "\n{facts} facts over {} turns, {:.2} per turn",
+            cases.len(),
+            facts as f64 / cases.len() as f64
         );
         println!(
-            "fact length {} chars, origin tool {:?}, target known {}",
-            cases[0].fact.len(),
-            cases[0].origin_tool,
-            !cases[0].origin_target.is_empty()
+            "first turn: {} messages intact ({a} tok), masked ({b} tok), {} fact(s)",
+            cases[0].messages_intact.len(),
+            cases[0].facts.len()
         );
         println!("\ndry run: nothing was sent.");
         return 0;
@@ -460,7 +447,7 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
     }
 
     let v = counterfactual::run(&cases, &key, a.show_raw);
-    let attempted = v.informative + v.discarded + v.unusable;
+    let attempted = v.turns_attempted;
     if !v.errors.is_empty() {
         eprintln!("\nThe run stopped: the API did not accept a request.");
         for e in &v.errors {
@@ -472,10 +459,15 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
         }
         eprintln!("{attempted} case(s) completed before it, reported below.");
     }
-    println!("\n{:<26}{:>8}", "cases attempted", attempted);
-    println!("{:<26}{:>8}", "discarded (control failed)", v.discarded);
-    println!("{:<26}{:>8}", "unusable (truncated)", v.unusable);
-    println!("{:<26}{:>8}", "informative", v.informative);
+    println!("\n{:<30}{:>8}", "turns replayed", v.turns_attempted);
+    println!(
+        "{:<30}{:>8}",
+        "turns with a live control", v.turns_informative
+    );
+    println!("{:<30}{:>8}", "sessions", v.sessions);
+    println!("{:<30}{:>8}", "facts discarded (control)", v.discarded);
+    println!("{:<30}{:>8}", "facts unusable (truncated)", v.unusable);
+    println!("{:<30}{:>8}", "facts informative", v.informative);
     if v.measured_tokens > 0 {
         println!(
             "\ninput tokens: {} measured by count_tokens, {toks} estimated",
@@ -506,7 +498,12 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
     println!("  {:<24}{:>8}{:>9}", "did neither", v.silent, p(v.silent));
     println!("\n'did neither' is the irreversible share: the fact was gone and the model");
     println!("did not ask for it back. 'went to fetch it' is the healthy failure.");
-    println!("this still measures the next action, not task success.");
+    println!(
+        "\n{} facts over {} turns in {} sessions. facts sharing a turn share one",
+        v.informative, v.turns_informative, v.sessions
+    );
+    println!("response, and facts sharing an origin share their 'went to fetch it'");
+    println!("verdict, so an interval bootstraps over sessions and not over facts.");
     0
 }
 

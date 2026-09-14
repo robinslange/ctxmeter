@@ -51,6 +51,7 @@ pub enum Outcome {
 /// losses are invisible cannot be audited.
 #[derive(Default)]
 pub struct Dropped {
+    pub turns_considered: usize,
     pub considered: usize,
     pub unrebuildable: usize,
     pub policy_kept_the_fact: usize,
@@ -61,16 +62,23 @@ pub struct Dropped {
     pub no_refetch_target: usize,
 }
 
+/// One destroyed fact and the file the call that produced it named. Seeking it
+/// means naming that file again, by any tool: `cat` and `Read` fetch the same
+/// thing, and the tool name alone is not evidence of anything in a corpus that
+/// is mostly `Read`.
+pub struct Fact {
+    pub text: String,
+    pub origin: String,
+}
+
+/// One replayed turn: the request as the agent saw it, the same request with the
+/// policy applied, and every fact the policy destroyed in it. The turn is the
+/// observation. The facts are what that one observation is scored against.
 pub struct Case {
-    /// Which session and which replayed turn this came from. Two cases sharing
-    /// both are one observation scored twice, and a sample that does not say so
-    /// reports an independence it does not have.
     pub session: usize,
     pub cut: u32,
-    pub fact: String,
     pub model: String,
-    pub origin_tool: String,
-    pub origin_target: String,
+    pub facts: Vec<Fact>,
     pub messages_intact: Vec<serde_json::Value>,
     pub messages_masked: Vec<serde_json::Value>,
     pub tools: Vec<serde_json::Value>,
@@ -347,7 +355,9 @@ pub fn build_cases(
     dropped: &mut Dropped,
 ) -> Vec<Case> {
     let (sessions, probes, paths, interned) = (c.sessions, c.probes, c.paths, c.interned);
-    let mut flat: Vec<(usize, &Probe)> = Vec::new();
+    // Probes reused in the same assistant turn replay as the same request, so
+    // group them before anything is selected or sent.
+    let mut turns: HashMap<(usize, u32), Vec<&Probe>> = HashMap::new();
     for (si, ps) in probes.iter().enumerate() {
         // Pooling two model families into one retention figure conflates them,
         // so a run covers one family. It is also 5x cheaper.
@@ -361,68 +371,67 @@ pub fn build_cases(
             continue;
         }
         for p in ps {
-            flat.push((si, p));
+            let cut = sessions[si]
+                .blocks
+                .get(p.use_at)
+                .map(|b| b.msg)
+                .unwrap_or(0);
+            turns.entry((si, cut)).or_default().push(p);
         }
     }
-    // Ordering by position within a trace interleaves sessions only when they are
-    // of comparable length. They are not: one long research session can hold most
-    // of the eligible probes and take most of a small sample, and several probes
-    // reused in one assistant turn become several cases sharing one request. The
-    // dry run prints distinct turns and sessions beside the case count for exactly
-    // this reason, because the case count on its own overstates what was observed.
-    flat.sort_by_key(|(si, p)| (p.use_at, *si));
-    // Stride for the spread, but visit every candidate in that order. A drop has
-    // to cost one case, not the whole sample: at sample 1, taking only the first
-    // candidate means one unusable probe reports no usable cases in the corpus.
-    let step = (flat.len() / sample.max(1)).max(1);
-    let order: Vec<usize> = (0..step)
-        .flat_map(|off| (off..flat.len()).step_by(step))
-        .collect();
+    let mut order: Vec<(usize, u32)> = turns.keys().copied().collect();
+    order.sort_unstable();
 
-    let mut out: Vec<(usize, usize, Case)> = Vec::new();
-    for (si, p) in order.into_iter().map(|i| flat[i]) {
+    let mut out: Vec<Case> = Vec::new();
+    for (si, cut) in order {
         if out.len() >= sample {
             break;
         }
+        let ps = &turns[&(si, cut)];
+        dropped.turns_considered += 1;
+        dropped.considered += ps.len();
         let path = Path::new(&paths[si]);
-        let msg_of_use = sessions[si]
-            .blocks
-            .get(p.use_at)
-            .map(|b| b.msg)
-            .unwrap_or(0);
-        dropped.considered += 1;
-        let Some((intact, tools, origin)) = rebuild(path, msg_of_use) else {
+        let Some((intact, tools, origin)) = rebuild(path, cut) else {
             dropped.unrebuildable += 1;
             continue;
         };
-        let fact = interned[p.tok as usize].clone();
-        // Find the tool_result that actually carries the fact, then the call that
-        // produced it, so a re-fetch attempt is recognisable. Picking any tool
-        // from the session would mislabel the outcome.
-        let mut otool = String::new();
-        let mut otarget = String::new();
-        'find: for m in &intact {
-            for b in m["content"].as_array().into_iter().flatten() {
-                if b["type"] == "tool_result" && b["content"].to_string().contains(&fact) {
-                    if let Some((n, t)) = b["tool_use_id"].as_str().and_then(|id| origin.get(id)) {
-                        otool = n.clone();
-                        otarget = t.clone();
+        let masked = apply_mask(&intact, &pol);
+        let mut facts: Vec<Fact> = Vec::new();
+        for p in ps {
+            let text = interned[p.tok as usize].clone();
+            // A fact is only usable if the policy actually removed it.
+            if masked
+                .iter()
+                .any(|m| m["content"].to_string().contains(&text))
+            {
+                dropped.policy_kept_the_fact += 1;
+                continue;
+            }
+            // Find the tool_result carrying the fact, then the call that produced
+            // it. Any other call in the session would mislabel a re-fetch.
+            let mut found = String::new();
+            'find: for m in &intact {
+                for b in m["content"].as_array().into_iter().flatten() {
+                    if b["type"] == "tool_result" && b["content"].to_string().contains(&text) {
+                        if let Some((_, t)) =
+                            b["tool_use_id"].as_str().and_then(|id| origin.get(id))
+                        {
+                            found = t.clone();
+                        }
+                        break 'find;
                     }
-                    break 'find;
                 }
             }
+            if found.is_empty() {
+                dropped.no_refetch_target += 1;
+                continue;
+            }
+            facts.push(Fact {
+                text,
+                origin: found,
+            });
         }
-        if otarget.is_empty() {
-            dropped.no_refetch_target += 1;
-            continue;
-        }
-        let masked = apply_mask(&intact, &pol);
-        // A probe is only usable if the policy actually removed the fact.
-        let still_there = masked
-            .iter()
-            .any(|m| m["content"].to_string().contains(&fact));
-        if still_there {
-            dropped.policy_kept_the_fact += 1;
+        if facts.is_empty() {
             continue;
         }
         let model = sessions[si]
@@ -430,26 +439,17 @@ pub fn build_cases(
             .first()
             .map(|u| u.model.clone())
             .unwrap_or_else(|| "claude-sonnet-5".into());
-        out.push((
-            si,
-            intact.len(),
-            Case {
-                session: si,
-                cut: msg_of_use,
-                fact,
-                model,
-                origin_tool: otool,
-                origin_target: otarget,
-                messages_intact: intact,
-                messages_masked: masked,
-                tools,
-            },
-        ));
+        out.push(Case {
+            session: si,
+            cut,
+            model,
+            facts,
+            messages_intact: intact,
+            messages_masked: masked,
+            tools,
+        });
     }
-    // Group by session and order by growing prefix, so each control arm extends
-    // the one before it and reads most of its context from cache.
-    out.sort_by_key(|(si, len, _)| (*si, *len));
-    out.into_iter().map(|(_, _, c)| c).collect()
+    out
 }
 
 /// The structural rules a Messages request has to satisfy. Checked without
@@ -698,10 +698,10 @@ fn unusable(resp: &serde_json::Value, g: Outcome) -> Option<String> {
     }
 }
 
-fn grade(resp: &serde_json::Value, c: &Case) -> Outcome {
+fn grade(resp: &serde_json::Value, f: &Fact) -> Outcome {
     let blocks = action_blocks(resp);
     let whole = serde_json::to_string(&blocks).unwrap_or_default();
-    if whole.contains(&c.fact) {
+    if whole.contains(&f.text) {
         return Outcome::Reproduced;
     }
     for b in blocks {
@@ -711,7 +711,7 @@ fn grade(resp: &serde_json::Value, c: &Case) -> Outcome {
         // quietly move the result into the healthy bucket. Only the target does
         // it, and any tool that names the target counts, because cat and Read
         // fetch the same file.
-        if b["type"] == "tool_use" && b["input"].to_string().contains(&c.origin_target) {
+        if b["type"] == "tool_use" && b["input"].to_string().contains(&f.origin) {
             return Outcome::Sought;
         }
     }
@@ -719,6 +719,11 @@ fn grade(resp: &serde_json::Value, c: &Case) -> Outcome {
 }
 
 pub struct Verdict {
+    pub turns_attempted: usize,
+    /// Turns where at least one fact's control arm reproduced it. The unit an
+    /// interval may bootstrap over is the session, and this bounds it.
+    pub turns_informative: usize,
+    pub sessions: usize,
     pub informative: usize,
     pub discarded: usize,
     pub unusable: usize,
@@ -733,8 +738,8 @@ pub struct Verdict {
     pub measured_tokens: u64,
 }
 
-fn show(label: &str, resp: &serde_json::Value, g: Outcome) {
-    println!("\n--- {label}: graded {g:?} ---");
+fn show(label: &str, resp: &serde_json::Value) {
+    println!("\n--- {label} ---");
     println!(
         "stop_reason {:?}   usage {}",
         resp.get("stop_reason")
@@ -750,6 +755,9 @@ fn show(label: &str, resp: &serde_json::Value, g: Outcome) {
 
 pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
     let mut v = Verdict {
+        turns_attempted: 0,
+        turns_informative: 0,
+        sessions: 0,
         informative: 0,
         discarded: 0,
         unusable: 0,
@@ -798,58 +806,87 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
     );
     println!("and less for every case whose control arm fails and never buys a second.");
 
+    let mut sessions: Vec<usize> = cases.iter().map(|c| c.session).collect();
+    sessions.sort_unstable();
+    sessions.dedup();
+    v.sessions = sessions.len();
+
     for (i, c) in cases.iter().enumerate() {
         if show_raw {
             println!(
-                "\ncase {i}: model {}, {} / {} tokens",
-                c.model, sizes[i].0, sizes[i].1
+                "\nturn {i}: session {}, cut {}, {} / {} tokens, {} fact(s)",
+                c.session,
+                c.cut,
+                sizes[i].0,
+                sizes[i].1,
+                c.facts.len()
             );
-            println!("fact ({} chars): {:?}", c.fact.len(), c.fact);
-            println!("seeking it means naming {:?}", c.origin_target);
+            for f in &c.facts {
+                println!("  fact ({} chars): {:?}", f.text.len(), f.text);
+                println!("    seeking it means naming {:?}", f.origin);
+            }
         }
-        // Control first. If the intact context does not reproduce the fact, the
-        // probe cannot tell us anything about the policy.
+        // Control first. A fact the intact context does not reproduce cannot tell
+        // us anything about the policy, and it is scored per fact because one
+        // response can reproduce one and miss another.
         let ctrl = match call(api_key, &c.model, &c.messages_intact, &c.tools) {
             Ok(r) => r,
             Err(e) => {
-                v.errors.push(format!("case {i} control: {e}"));
+                v.errors.push(format!("turn {i} control: {e}"));
                 return v;
             }
         };
-        let g = grade(&ctrl, c);
+        v.turns_attempted += 1;
+        let mut live: Vec<&Fact> = Vec::new();
+        for f in &c.facts {
+            let g = grade(&ctrl, f);
+            if show_raw {
+                println!("  control graded {g:?} for {:?}", f.text);
+            }
+            if let Some(why) = unusable(&ctrl, g) {
+                println!("turn {i} fact unusable: {why}");
+                v.unusable += 1;
+                continue;
+            }
+            if g != Outcome::Reproduced {
+                v.discarded += 1;
+                continue;
+            }
+            live.push(f);
+        }
         if show_raw {
-            show("control (context intact)", &ctrl, g);
+            show("control (context intact)", &ctrl);
         }
-        if let Some(why) = unusable(&ctrl, g) {
-            println!("case {i} control unusable: {why}");
-            v.unusable += 1;
+        if live.is_empty() {
             continue;
         }
-        if g != Outcome::Reproduced {
-            v.discarded += 1;
-            continue;
-        }
+        v.turns_informative += 1;
         let treat = match call(api_key, &c.model, &c.messages_masked, &c.tools) {
             Ok(r) => r,
             Err(e) => {
-                v.errors.push(format!("case {i} treatment: {e}"));
+                v.errors.push(format!("turn {i} treatment: {e}"));
                 return v;
             }
         };
-        let gt = grade(&treat, c);
         if show_raw {
-            show("treatment (fact removed)", &treat, gt);
+            show("treatment (fact removed)", &treat);
         }
-        if let Some(why) = unusable(&treat, gt) {
-            println!("case {i} treatment unusable: {why}");
-            v.unusable += 1;
-            continue;
-        }
-        v.informative += 1;
-        match gt {
-            Outcome::Reproduced => v.reproduced += 1,
-            Outcome::Sought => v.sought += 1,
-            Outcome::Silent => v.silent += 1,
+        for f in live {
+            let g = grade(&treat, f);
+            if show_raw {
+                println!("  treatment graded {g:?} for {:?}", f.text);
+            }
+            if let Some(why) = unusable(&treat, g) {
+                println!("turn {i} fact unusable: {why}");
+                v.unusable += 1;
+                continue;
+            }
+            v.informative += 1;
+            match g {
+                Outcome::Reproduced => v.reproduced += 1,
+                Outcome::Sought => v.sought += 1,
+                Outcome::Silent => v.silent += 1,
+            }
         }
     }
     v
@@ -899,17 +936,37 @@ mod tests {
         serde_json::json!({"stop_reason": "end_turn", "content": blocks})
     }
 
-    fn case() -> Case {
-        Case {
-            session: 0,
-            cut: 0,
-            fact: "a7f3c9e21b84".into(),
+    /// Four facts reused in one assistant turn are one replayed request, not four.
+    /// Issuing four would draw four independent samples of a non-deterministic
+    /// response and could return contradictory verdicts for the same context.
+    #[test]
+    fn facts_reused_in_one_turn_become_one_case() {
+        let c = Case {
+            session: 3,
+            cut: 40,
             model: "claude-sonnet-5".into(),
-            origin_tool: "Read".into(),
-            origin_target: "/tmp/build.log".into(),
+            facts: vec![
+                Fact {
+                    text: "a7f3c9e21b84".into(),
+                    origin: "/home/dev/build.log".into(),
+                },
+                Fact {
+                    text: "b81d0c4a9f27".into(),
+                    origin: "/home/dev/build.log".into(),
+                },
+            ],
             messages_intact: vec![],
             messages_masked: vec![],
             tools: vec![],
+        };
+        assert_eq!(c.facts.len(), 2);
+        assert_eq!(c.cut, 40);
+    }
+
+    fn fact() -> Fact {
+        Fact {
+            text: "a7f3c9e21b84".into(),
+            origin: "/home/dev/build.log".into(),
         }
     }
 
@@ -918,7 +975,7 @@ mod tests {
     /// discarded and every later number would be built on the wrong cases.
     #[test]
     fn a_control_that_does_not_reproduce_the_fact_is_not_informative() {
-        let c = case();
+        let c = fact();
         let got = resp(serde_json::json!([{"type": "text", "text": "let me check the config"}]));
         assert_ne!(grade(&got, &c), Outcome::Reproduced);
         let got = resp(serde_json::json!([{"type": "text", "text": "build a7f3c9e21b84 failed"}]));
@@ -931,13 +988,13 @@ mod tests {
     /// the finding into the healthy bucket for free.
     #[test]
     fn going_back_for_the_fact_means_going_back_to_its_origin() {
-        let c = case();
+        let c = fact();
         let same_file = resp(serde_json::json!([
-            {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/tmp/build.log"}}
+            {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/home/dev/build.log"}}
         ]));
         assert_eq!(grade(&same_file, &c), Outcome::Sought);
         let other_tool_same_file = resp(serde_json::json!([
-            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "cat /tmp/build.log"}}
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "cat /home/dev/build.log"}}
         ]));
         assert_eq!(grade(&other_tool_same_file, &c), Outcome::Sought);
         let same_tool_other_file = resp(serde_json::json!([
@@ -951,12 +1008,33 @@ mod tests {
     /// actually used it.
     #[test]
     fn a_fact_recalled_while_thinking_is_not_a_reuse() {
-        let c = case();
+        let c = fact();
         let got = resp(serde_json::json!([
             {"type": "thinking", "thinking": "the id was a7f3c9e21b84", "signature": "x"},
             {"type": "text", "text": "I will look it up again"}
         ]));
         assert_ne!(grade(&got, &c), Outcome::Reproduced);
+    }
+
+    /// The point of the change: one replayed response, several facts. A turn that
+    /// reproduces one fact and not another is one observation with two outcomes,
+    /// which is what it always was. Two requests would have made it two events and
+    /// could have disagreed with itself.
+    #[test]
+    fn one_response_is_graded_against_each_fact_of_the_turn() {
+        let here = Fact {
+            text: "a7f3c9e21b84".into(),
+            origin: "/home/dev/build.log".into(),
+        };
+        let gone = Fact {
+            text: "b81d0c4a9f27".into(),
+            origin: "/home/dev/other.log".into(),
+        };
+        let got = resp(serde_json::json!([
+            {"type": "text", "text": "build a7f3c9e21b84 failed"}
+        ]));
+        assert_eq!(grade(&got, &here), Outcome::Reproduced);
+        assert_eq!(grade(&got, &gone), Outcome::Silent);
     }
 
     /// A turn cut off by the output ceiling says nothing about the policy. Graded
