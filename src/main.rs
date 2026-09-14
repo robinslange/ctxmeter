@@ -322,6 +322,23 @@ struct CfArgs {
     min_gap: usize,
 }
 
+/// What the selection lost, and where each denominator comes from. `other model`
+/// is counted over the whole corpus before any turn is visited, so it is not a
+/// component of `facts considered` and is not printed as one.
+fn print_drops(d: &counterfactual::Dropped, built: usize) {
+    println!(
+        "facts on another model, corpus-wide: {} (excluded before selection)",
+        d.other_model
+    );
+    println!("turns considered  : {}", d.turns_considered);
+    println!("  unrebuildable   : {}", d.unrebuildable);
+    println!("facts considered  : {}", d.considered);
+    println!("  policy kept it  : {}", d.policy_kept_the_fact);
+    println!("  no re-fetch tgt : {}", d.no_refetch_target);
+    println!("  fact is origin  : {}", d.fact_is_its_origin);
+    println!("turns built       : {built}");
+}
+
 fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
     let sessions = eligible(all);
     let probes = harvest(&sessions, a.max_df, a.min_gap);
@@ -338,13 +355,7 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
     let cases = counterfactual::build_cases(&corpus, pol, a.sample, &a.model, &mut dropped);
     if cases.is_empty() {
         println!("No usable turns.");
-        println!("turns considered  : {}", dropped.turns_considered);
-        println!("  unrebuildable   : {}", dropped.unrebuildable);
-        println!("facts considered  : {}", dropped.considered);
-        println!("  policy kept it  : {}", dropped.policy_kept_the_fact);
-        println!("  no re-fetch tgt : {}", dropped.no_refetch_target);
-        println!("  other model     : {}", dropped.other_model);
-        println!("turns built       : {}", cases.len());
+        print_drops(&dropped, cases.len());
         return 1;
     }
 
@@ -371,15 +382,14 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
         .sum();
     println!("policy under test: {}", pol.label());
     println!("model family    : {}", a.model);
-    println!("turns considered  : {}", dropped.turns_considered);
-    println!("  unrebuildable   : {}", dropped.unrebuildable);
-    println!("facts considered  : {}", dropped.considered);
-    println!("  policy kept it  : {}", dropped.policy_kept_the_fact);
-    println!("  no re-fetch tgt : {}", dropped.no_refetch_target);
-    println!("  other model     : {}", dropped.other_model);
-    println!("turns built       : {}", cases.len());
+    print_drops(&dropped, cases.len());
     println!("input tokens     : {toks} across both arms");
-    println!("estimated spend  : ${cost:.2}  (published prices, checked 2026-09-14)");
+    println!("spend ceiling    : ${cost:.2}  (published prices, checked 2026-09-14)");
+    println!("\na ceiling, not an estimate, and it reads high: it bounds output at the");
+    println!("ceiling for two arms per turn against an observed mean near 985 tokens,");
+    println!("takes input from serialized length over 4 which runs about 1.5x low, and");
+    println!("buys 2 arms per turn where about 1.21 are bought, since a turn whose");
+    println!("control arm fails never buys its second.");
     println!("\neach turn is at most two calls: the intact context as control, then the");
     println!("policy applied. a fact only counts if the control arm reproduces it.");
 
@@ -465,10 +475,7 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
         eprintln!("{attempted} case(s) completed before it, reported below.");
     }
     println!("\n{:<30}{:>8}", "turns replayed", v.turns_attempted);
-    println!(
-        "{:<30}{:>8}",
-        "turns with a live control", v.turns_informative
-    );
+    println!("{:<30}{:>8}", "turns yielding a fact", v.turns_informative);
     println!("{:<30}{:>8}", "sessions", v.sessions);
     println!("{:<30}{:>8}", "facts discarded (control)", v.discarded);
     println!("{:<30}{:>8}", "facts unusable (truncated)", v.unusable);

@@ -30,7 +30,7 @@ fn price(model: &str) -> (f64, f64) {
         (5.0, 25.0)
     } else if model.contains("haiku") {
         (1.0, 5.0)
-    } else if model.contains("sonnet-4-6") {
+    } else if model.contains("sonnet-4-6") || model.contains("sonnet-4-5") {
         (3.0, 15.0)
     } else {
         (2.0, 10.0)
@@ -63,12 +63,26 @@ pub struct Dropped {
     /// would be indistinguishable from silence. Dropped rather than graded, since
     /// the two outcomes it cannot separate are the two that carry the finding.
     pub no_refetch_target: usize,
+    /// The fact and the target of the call that produced it contain one another:
+    /// `ident_char` admits `/` and `.`, so a probe token can be a path, and `grep -n`
+    /// output carries the file it searched. Reproducing such a fact means putting the
+    /// whole token in an action, seeking it means naming the origin, and the origin
+    /// is a substring of the token — so every reproduction is also a re-fetch and
+    /// which bucket it lands in turns on whether the model kept the line number.
+    /// Dropped rather than graded, the argument `no_refetch_target` already won.
+    ///
+    /// The mirror case, a fact contained in its origin, never reaches here: the
+    /// origin sits in a `tool_use` input, which no policy masks, so the fact is
+    /// still in the treatment arm and `policy_kept_the_fact` claims it first.
+    pub fact_is_its_origin: usize,
 }
 
-/// One destroyed fact and the file the call that produced it named. Seeking it
-/// means naming that file again, by any tool: `cat` and `Read` fetch the same
+/// One destroyed fact and what the call that produced it reached for: the file a
+/// `Read` or a shell command named, or the pattern a `Grep` searched. Seeking it
+/// means naming that target again, by any tool: `cat` and `Read` fetch the same
 /// thing, and the tool name alone is not evidence of anything in a corpus that
-/// is mostly `Read`.
+/// is mostly `Read`. For a search the target is the pattern, so seeking means
+/// searching for the same string again.
 pub struct Fact {
     pub text: String,
     pub origin: String,
@@ -385,11 +399,14 @@ pub fn build_cases(
     for (si, ps) in probes.iter().enumerate() {
         // Pooling two model families into one retention figure conflates them,
         // so a run covers one family. It is also 5x cheaper.
-        let model_ok = sessions[si]
-            .usage
-            .first()
-            .map(|u| u.model.contains(model_filter))
-            .unwrap_or(false);
+        //
+        // Every usage row, not the first: a session can switch family mid-way
+        // (22 of 657 on the corpus this was measured against), and reading only
+        // the first row replays, prices and reports an Opus turn as a Sonnet one.
+        // The guard against a run spanning two families reads the same value, so
+        // it cannot catch this. A session that switches drops out instead.
+        let u = &sessions[si].usage;
+        let model_ok = !u.is_empty() && u.iter().all(|u| u.model.contains(model_filter));
         if !model_ok {
             dropped.other_model += ps.len();
             continue;
@@ -448,6 +465,10 @@ pub fn build_cases(
             }
             if found.is_empty() {
                 dropped.no_refetch_target += 1;
+                continue;
+            }
+            if found.contains(&text) || text.contains(&found) {
+                dropped.fact_is_its_origin += 1;
                 continue;
             }
             facts.push(Fact {
@@ -526,16 +547,25 @@ pub fn estimate_tokens(c: &Case) -> (u64, u64) {
     (a + t, b + t)
 }
 
+/// What one turn costs at worst, from the input tokens of its two arms.
+///
+/// A cache write bills at 1.25x and nothing in a run reads it back, output is
+/// charged at the ceiling for both arms, and a treatment arm only runs when its
+/// control reproduced. So this is a bound, and the dry-run estimate and the
+/// pre-flight ceiling call it rather than each spelling it out.
+fn arm_cost(model: &str, intact: u64, masked: u64) -> f64 {
+    let (inp, outp) = price(model);
+    (intact + masked) as f64 / 1e6 * inp * 1.25 + 2.0 * MAX_TOKENS as f64 / 1e6 * outp
+}
+
 pub fn estimate_cost(cases: &[Case]) -> f64 {
-    let mut usd = 0.0;
-    for c in cases {
-        let (a, b) = estimate_tokens(c);
-        let (inp, outp) = price(&c.model);
-        // A cache write bills at 1.25x, and nothing in a run reads it back.
-        usd += (a + b) as f64 / 1e6 * inp * 1.25;
-        usd += 2.0 * MAX_TOKENS as f64 / 1e6 * outp; // both arms, at the ceiling
-    }
-    usd
+    cases
+        .iter()
+        .map(|c| {
+            let (a, b) = estimate_tokens(c);
+            arm_cost(&c.model, a, b)
+        })
+        .sum()
 }
 
 /// Agent turns in a real corpus write documents, not one-liners: at 2048, two of
@@ -765,8 +795,10 @@ fn is_live_control(g: Outcome) -> bool {
 
 pub struct Verdict {
     pub turns_attempted: usize,
-    /// Turns where at least one fact's control arm reproduced it. The unit an
-    /// interval may bootstrap over is the session, and this bounds it.
+    /// Turns that yielded at least one informative fact: the control arm
+    /// reproduced it and the treatment arm graded usably. A turn whose control was
+    /// live and whose treatment came back truncated for every fact is not here,
+    /// so this is below the count of turns that bought two calls.
     pub turns_informative: usize,
     pub sessions: usize,
     pub informative: usize,
@@ -839,12 +871,7 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
     let ceiling: f64 = cases
         .iter()
         .zip(&sizes)
-        .map(|(c, (a, b))| {
-            let (inp, outp) = price(&c.model);
-            // A cache write bills at 1.25x, and a treatment arm only runs when its
-            // control reproduced, so this is a ceiling and not the bill.
-            (a + b) as f64 / 1e6 * inp * 1.25 + 2.0 * MAX_TOKENS as f64 / 1e6 * outp
-        })
+        .map(|(c, (a, b))| arm_cost(&c.model, *a, *b))
         .sum();
     println!(
         "\nmeasured {} input tokens across both arms of {} cases: at most ${ceiling:.2},",
@@ -991,31 +1018,193 @@ mod tests {
         serde_json::json!({"stop_reason": "end_turn", "content": blocks})
     }
 
-    /// Four facts reused in one assistant turn are one replayed request, not four.
-    /// Issuing four would draw four independent samples of a non-deterministic
+    /// Two facts reused in one assistant turn are one replayed request, not two.
+    /// Issuing two would draw two independent samples of a non-deterministic
     /// response and could return contradictory verdicts for the same context.
+    ///
+    /// Driven through `build_cases` against the fixture, because that is the only
+    /// place the grouping lives: a version that emits one case per probe returns
+    /// three here.
     #[test]
     fn facts_reused_in_one_turn_become_one_case() {
-        let c = Case {
-            session: 3,
-            cut: 40,
-            model: "claude-sonnet-5".into(),
-            facts: vec![
-                Fact {
-                    text: "a7f3c9e21b84".into(),
-                    origin: "/home/dev/build.log".into(),
-                },
-                Fact {
-                    text: "b81d0c4a9f27".into(),
-                    origin: "/home/dev/build.log".into(),
-                },
-            ],
-            messages_intact: vec![],
-            messages_masked: vec![],
-            tools: vec![],
+        use crate::transcript::{Block, Kind, Role, Usage};
+        let block = |msg: u32| Block {
+            msg,
+            kind: Kind::ToolResult,
+            role: Role::Assistant,
+            tokens: 0,
+            toks: vec![],
         };
-        assert_eq!(c.facts.len(), 2);
-        assert_eq!(c.cut, 40);
+        let usage = |model: &str| Usage {
+            ts: "2026-09-01T10:00:01Z".into(),
+            model: model.into(),
+            read: 0,
+            write: 0,
+            fresh: 0,
+            out: 0,
+        };
+        // Two probes reused at message 7, one at message 5. Both tokens sit in the
+        // tool_result the policy masks at either cut, and the call that produced
+        // them named a file, so all three are usable facts.
+        let session = Session {
+            path: "tests/fixture/session.jsonl".into(),
+            msgs: 8,
+            blocks: vec![block(7), block(7), block(5)],
+            turns: vec![],
+            usage: vec![usage("claude-sonnet-5")],
+        };
+        let interned = [
+            "a7f3c9e21b84".to_string(),
+            "5c1e8b73d940e2".to_string(),
+            "unused".to_string(),
+        ];
+        let probes = vec![vec![
+            Probe {
+                tok: 0,
+                origin: 0,
+                use_at: 0,
+            },
+            Probe {
+                tok: 1,
+                origin: 0,
+                use_at: 1,
+            },
+            Probe {
+                tok: 0,
+                origin: 0,
+                use_at: 2,
+            },
+        ]];
+        let sessions = [&session];
+        let paths = [session.path.clone()];
+        let corpus = Corpus {
+            sessions: &sessions,
+            probes: &probes,
+            paths: &paths,
+            interned: &interned,
+        };
+        let mut dropped = Dropped::default();
+        let cases = build_cases(&corpus, Policy::KeepLast(1), 10, "sonnet-5", &mut dropped);
+        assert_eq!(cases.len(), 2, "one case per turn, not one per fact");
+        let shared = cases.iter().find(|c| c.cut == 7).expect("the shared turn");
+        assert_eq!(
+            shared.facts.len(),
+            2,
+            "both facts ride one replayed request"
+        );
+        for f in &shared.facts {
+            assert_eq!(f.origin, "/srv/app/deploy.log");
+        }
+        assert!(!shared.messages_intact.is_empty(), "nothing was rebuilt");
+        let other = cases.iter().find(|c| c.cut == 5).expect("the other turn");
+        assert_eq!(other.facts.len(), 1, "a different turn is a different case");
+    }
+
+    /// `grep -n` output is a probe token that carries its own file path, so the
+    /// whole token names the origin. Reproducing it needs the whole token in an
+    /// action; seeking it needs only the path, which every reproduction also
+    /// contains. The two buckets nest, and which one a fact lands in turns on
+    /// whether the model kept the line number. Dropped, not graded.
+    #[test]
+    fn a_fact_that_contains_its_own_origin_is_dropped() {
+        use crate::transcript::{Block, Kind, Role, Usage};
+        let session = Session {
+            path: "tests/fixture/path-probe.jsonl".into(),
+            msgs: 5,
+            blocks: vec![Block {
+                msg: 5,
+                kind: Kind::ToolResult,
+                role: Role::Assistant,
+                tokens: 0,
+                toks: vec![],
+            }],
+            turns: vec![],
+            usage: vec![Usage {
+                ts: "2026-09-02T09:00:01Z".into(),
+                model: "claude-sonnet-5".into(),
+                read: 0,
+                write: 0,
+                fresh: 0,
+                out: 0,
+            }],
+        };
+        let interned = ["src/routes/invoices.v2.ts:42".to_string()];
+        let probes = vec![vec![Probe {
+            tok: 0,
+            origin: 0,
+            use_at: 0,
+        }]];
+        let sessions = [&session];
+        let paths = [session.path.clone()];
+        let corpus = Corpus {
+            sessions: &sessions,
+            probes: &probes,
+            paths: &paths,
+            interned: &interned,
+        };
+        let mut dropped = Dropped::default();
+        let cases = build_cases(&corpus, Policy::KeepLast(1), 10, "sonnet-5", &mut dropped);
+        assert_eq!(dropped.fact_is_its_origin, 1);
+        assert!(cases.is_empty(), "a fact whose buckets nest was graded");
+    }
+
+    /// A session that switches model family mid-way cannot be replayed as either
+    /// one. Reading only the first usage row prices and reports it as the family it
+    /// started in, and the guard against a run spanning two families reads that
+    /// same row, so it cannot see the switch.
+    #[test]
+    fn a_session_that_switches_model_family_is_not_eligible() {
+        use crate::transcript::{Block, Kind, Role, Usage};
+        let usage = |model: &str| Usage {
+            ts: "2026-09-01T10:00:01Z".into(),
+            model: model.into(),
+            read: 0,
+            write: 0,
+            fresh: 0,
+            out: 0,
+        };
+        let session = Session {
+            path: "tests/fixture/session.jsonl".into(),
+            msgs: 8,
+            blocks: vec![Block {
+                msg: 5,
+                kind: Kind::ToolResult,
+                role: Role::Assistant,
+                tokens: 0,
+                toks: vec![],
+            }],
+            turns: vec![],
+            usage: vec![usage("claude-sonnet-5"), usage("claude-opus-4-1")],
+        };
+        let interned = ["a7f3c9e21b84".to_string()];
+        let probes = vec![vec![Probe {
+            tok: 0,
+            origin: 0,
+            use_at: 0,
+        }]];
+        let sessions = [&session];
+        let paths = [session.path.clone()];
+        let corpus = Corpus {
+            sessions: &sessions,
+            probes: &probes,
+            paths: &paths,
+            interned: &interned,
+        };
+        let mut dropped = Dropped::default();
+        let cases = build_cases(&corpus, Policy::KeepLast(1), 10, "sonnet-5", &mut dropped);
+        assert!(cases.is_empty(), "replayed an Opus turn as a Sonnet one");
+        assert_eq!(dropped.other_model, 1);
+    }
+
+    /// The published price of a model is not the price of its predecessor. A run
+    /// filtered to one model passes the two-family guard, so nothing else catches a
+    /// missing branch, and the figure it understates is the one printed before --yes.
+    #[test]
+    fn every_model_family_in_the_corpus_is_priced() {
+        assert_eq!(price("claude-sonnet-4-5-20250929"), (3.0, 15.0));
+        assert_eq!(price("claude-sonnet-4-6"), (3.0, 15.0));
+        assert_eq!(price("claude-sonnet-5"), (2.0, 10.0));
+        assert_eq!(price("claude-opus-4-1"), (5.0, 25.0));
     }
 
     fn fact() -> Fact {
