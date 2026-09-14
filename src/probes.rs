@@ -184,7 +184,32 @@ const R: f64 = 0.10;
 /// the real prefix sizes from the usage records. The invisible remainder of each
 /// prefix (system prompt and tool definitions) is carried unchanged, because no
 /// context policy can touch it.
+#[derive(Clone, Copy, PartialEq)]
+pub enum CacheModel {
+    /// Credit every unchanged leading block as a cache read. Generous to masking.
+    LongestPrefix,
+    /// Matching is anchored at breakpoints with a 20-block lookback, and measured
+    /// invalidation on real traces is all-or-nothing. So any change in the message
+    /// region forfeits the whole region; only system and tools stay cached.
+    AllOrNothing,
+}
+
+/// Multiplies the per-block token estimate, to test how far the conclusion depends
+/// on the estimator rather than on the mechanism.
+pub struct CostOpts {
+    pub model: CacheModel,
+    pub scale: f64,
+}
+
 pub fn billed_cost(sessions: &[&Session], pol: Option<Policy>) -> f64 {
+    billed_cost_with(
+        sessions,
+        pol,
+        &CostOpts { model: CacheModel::LongestPrefix, scale: 1.0 },
+    )
+}
+
+pub fn billed_cost_with(sessions: &[&Session], pol: Option<Policy>, o: &CostOpts) -> f64 {
     let mut cost = 0.0;
     for s in sessions {
         let tr: Vec<usize> = s
@@ -194,10 +219,11 @@ pub fn billed_cost(sessions: &[&Session], pol: Option<Policy>) -> f64 {
             .filter(|(_, b)| b.kind == Kind::ToolResult)
             .map(|(i, _)| i)
             .collect();
-        let mut prev: Vec<(usize, u32)> = Vec::new();
+        let mut prev: Vec<(usize, u64)> = Vec::new();
         for &(cut, real) in &s.turns {
             let cut = cut.min(s.blocks.len());
-            let raw: u64 = s.blocks[..cut].iter().map(|b| b.tokens as u64).sum();
+            let sz = |b: &Block| (b.tokens as f64 * o.scale) as u64;
+            let raw: u64 = s.blocks[..cut].iter().map(sz).sum();
             let invisible = real.saturating_sub(raw);
 
             let live_end = tr.partition_point(|&i| i < cut);
@@ -206,34 +232,126 @@ pub fn billed_cost(sessions: &[&Session], pol: Option<Policy>) -> f64 {
             let masked: std::collections::HashSet<usize> =
                 live[..from.min(live.len())].iter().copied().collect();
 
-            let cur: Vec<(usize, u32)> = s.blocks[..cut]
+            let cur: Vec<(usize, u64)> = s.blocks[..cut]
                 .iter()
                 .enumerate()
                 .map(|(i, b)| {
-                    let t = if masked.contains(&i) && b.tokens > PLACEHOLDER {
-                        PLACEHOLDER
+                    let full = sz(b);
+                    let t = if masked.contains(&i) && full > PLACEHOLDER as u64 {
+                        PLACEHOLDER as u64
                     } else {
-                        b.tokens
+                        full
                     };
                     (i, t)
                 })
                 .collect();
 
-            let mut shared: u64 = 0;
+            let mut lcp: u64 = 0;
+            let mut identical = cur.len() == prev.len();
             for (a, b) in cur.iter().zip(prev.iter()) {
                 if a == b {
-                    shared += a.1 as u64;
+                    lcp += a.1;
                 } else {
+                    identical = false;
                     break;
                 }
             }
+            let mut shared = match o.model {
+                CacheModel::LongestPrefix => lcp,
+                // the appended tail is new either way; what differs is whether an
+                // edit inside the region forfeits the blocks before it
+                CacheModel::AllOrNothing => {
+                    let unchanged_prefix = identical || lcp >= prev.iter().map(|x| x.1).sum::<u64>();
+                    if unchanged_prefix { lcp } else { 0 }
+                }
+            };
             if !prev.is_empty() {
                 shared += invisible;
             }
-            let total: u64 = cur.iter().map(|x| x.1 as u64).sum::<u64>() + invisible;
+            let total: u64 = cur.iter().map(|x| x.1).sum::<u64>() + invisible;
             cost += R * shared as f64 + W * total.saturating_sub(shared) as f64;
             prev = cur;
         }
     }
     cost
+}
+
+/// Retention counted per session, so uncertainty can be clustered correctly:
+/// probes inside one session share a trajectory and a mask boundary, so they
+/// are not independent observations.
+pub fn retention_by_session(
+    sessions: &[&Session],
+    probes: &[Vec<Probe>],
+    pol: Policy,
+) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for (s, ps) in sessions.iter().zip(probes) {
+        if ps.is_empty() {
+            continue;
+        }
+        let tr: Vec<usize> = s
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.kind == Kind::ToolResult)
+            .map(|(i, _)| i)
+            .collect();
+        let mut kept = 0u64;
+        let mut total = 0u64;
+        for p in ps {
+            let cut = tr.partition_point(|&i| i < p.use_at);
+            let live = &tr[..cut];
+            let holders: Vec<usize> = live
+                .iter()
+                .enumerate()
+                .filter(|(_, &i)| has(&s.blocks[i], p.tok))
+                .map(|(pos, _)| pos)
+                .collect();
+            if holders.is_empty() {
+                continue;
+            }
+            total += 1;
+            let from = pol.survives_from(live, &s.blocks);
+            if holders.iter().any(|&pos| pos >= from) {
+                kept += 1;
+            }
+        }
+        if total > 0 {
+            out.push((kept, total));
+        }
+    }
+    out
+}
+
+/// Cluster bootstrap: resample whole sessions, not individual probes.
+pub fn bootstrap_ci(per_session: &[(u64, u64)], iters: usize) -> (f64, f64) {
+    if per_session.is_empty() {
+        return (f64::NAN, f64::NAN);
+    }
+    let mut state: u64 = 0x2545F4914F6CDD1D;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let n = per_session.len();
+    let mut rs: Vec<f64> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let mut k = 0u64;
+        let mut t = 0u64;
+        for _ in 0..n {
+            let (a, b) = per_session[(next() as usize) % n];
+            k += a;
+            t += b;
+        }
+        if t > 0 {
+            rs.push(k as f64 / t as f64);
+        }
+    }
+    rs.sort_by(f64::total_cmp);
+    if rs.is_empty() {
+        return (f64::NAN, f64::NAN);
+    }
+    (rs[rs.len() * 25 / 1000], rs[rs.len() * 975 / 1000])
 }

@@ -2,7 +2,10 @@ mod probes;
 mod transcript;
 
 use clap::{Parser, Subcommand};
-use probes::{billed_cost, default_policies, eligible, harvest, retention};
+use probes::{
+    billed_cost, billed_cost_with, bootstrap_ci, default_policies, eligible, harvest, retention,
+    retention_by_session, CacheModel, CostOpts,
+};
 use std::path::PathBuf;
 use transcript::{Interner, Session};
 
@@ -37,6 +40,14 @@ enum Cmd {
     },
     /// Widen the sample and check the policy ranking does not move.
     Sensitivity,
+    /// Does the conclusion survive its own assumptions? Cache model, estimator
+    /// scale, and uncertainty clustered by session.
+    Robustness {
+        #[arg(long, default_value_t = 3)]
+        max_df: usize,
+        #[arg(long, default_value_t = 5)]
+        min_gap: usize,
+    },
     /// What each policy saves against what it destroys. The same knob does both.
     Tradeoff {
         #[arg(long, default_value_t = 3)]
@@ -299,6 +310,79 @@ fn cmd_tradeoff(all: &[Session], max_df: usize, min_gap: usize) -> i32 {
     0
 }
 
+fn cmd_robustness(all: &[Session], max_df: usize, min_gap: usize) -> i32 {
+    let sessions = eligible(all);
+    let probes = harvest(&sessions, max_df, min_gap);
+    if probes.iter().all(|v| v.is_empty()) {
+        println!("NO PROBES HARVESTED.");
+        return 1;
+    }
+    let pols = default_policies();
+
+    println!("1. COST MODEL. The cost column is a simulation. Does its sign survive");
+    println!("   replacing generous prefix matching with the all-or-nothing behaviour");
+    println!("   measured on real traces?\n");
+    println!("{:<20}{:>16}{:>16}", "policy", "longest-prefix", "all-or-nothing");
+    for &m in &[CacheModel::LongestPrefix, CacheModel::AllOrNothing] {
+        let _ = m;
+    }
+    for pol in &pols {
+        let mut cells = Vec::new();
+        for &m in &[CacheModel::LongestPrefix, CacheModel::AllOrNothing] {
+            let o = CostOpts { model: m, scale: 1.0 };
+            let base = billed_cost_with(&sessions, None, &o);
+            let c = billed_cost_with(&sessions, Some(*pol), &o);
+            cells.push((1.0 - c / base) * 100.0);
+        }
+        println!("{:<20}{:>15.1}%{:>15.1}%", pol.label(), cells[0], cells[1]);
+    }
+
+    println!("\n2. ESTIMATOR. Per-block sizes are character estimates. Does the sign");
+    println!("   survive scaling every visible block by 2x and 3x?\n");
+    println!("{:<20}{:>10}{:>10}{:>10}", "policy", "1x", "2x", "3x");
+    for pol in &pols {
+        let mut cells = Vec::new();
+        for sc in [1.0, 2.0, 3.0] {
+            let o = CostOpts { model: CacheModel::LongestPrefix, scale: sc };
+            let base = billed_cost_with(&sessions, None, &o);
+            let c = billed_cost_with(&sessions, Some(*pol), &o);
+            cells.push((1.0 - c / base) * 100.0);
+        }
+        println!(
+            "{:<20}{:>9.1}%{:>9.1}%{:>9.1}%",
+            pol.label(),
+            cells[0],
+            cells[1],
+            cells[2]
+        );
+    }
+
+    println!("\n3. UNCERTAINTY. Probes inside one session share a trajectory, so they");
+    println!("   are not independent. 95% interval from a cluster bootstrap over");
+    println!("   sessions, 2000 resamples.\n");
+    println!("{:<20}{:>10}{:>22}{:>10}", "policy", "retained", "95% CI (clustered)", "sessions");
+    for pol in &pols {
+        let per = retention_by_session(&sessions, &probes, *pol);
+        let (kept, total) = retention(&sessions, &probes, *pol);
+        if total == 0 {
+            continue;
+        }
+        let (lo, hi) = bootstrap_ci(&per, 2000);
+        println!(
+            "{:<20}{:>9.1}%{:>14.1}% - {:>4.1}%{:>10}",
+            pol.label(),
+            kept as f64 / total as f64 * 100.0,
+            lo * 100.0,
+            hi * 100.0,
+            per.len()
+        );
+    }
+    println!("\nnot tested here: whether a lost fact changes the outcome, and whether");
+    println!("an implementation that keeps originals retrievable recovers it.");
+    println!("both of those make this an upper bound on harm, not a measurement of it.");
+    0
+}
+
 fn main() {
     allow_sigpipe();
     let cli = Cli::parse();
@@ -321,6 +405,7 @@ fn main() {
         Cmd::Probes { max_df, min_gap } => cmd_probes(&sessions, max_df, min_gap),
         Cmd::Sensitivity => cmd_sensitivity(&sessions),
         Cmd::Tradeoff { max_df, min_gap } => cmd_tradeoff(&sessions, max_df, min_gap),
+        Cmd::Robustness { max_df, min_gap } => cmd_robustness(&sessions, max_df, min_gap),
     };
     std::process::exit(code);
 }

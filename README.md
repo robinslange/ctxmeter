@@ -12,6 +12,7 @@ cargo build --release
 ./target/release/ctxmeter probes       # how much later-needed information each policy destroys
 ./target/release/ctxmeter sensitivity  # does the policy ranking survive widening the sample
 ./target/release/ctxmeter tradeoff     # what each policy saves against what it destroys
+./target/release/ctxmeter robustness   # does the conclusion survive its own assumptions
 ```
 
 `ctxmeter.py` is kept as a reference implementation. The Rust binary is what you
@@ -158,14 +159,44 @@ region is re-written at 1.25x instead of read at 0.10x, so the penalty is roughl
 how often it fires multiplied by how much it keeps. That product peaks in the
 middle, which is why 40k is worse than both 10k and 100k.
 
-Masking pays only at the extremes, keeping almost nothing or almost everything.
-A shipped default of keeping the last 3 tool results sits inside the only band
-where it saves money at all, and retains 27.6%.
+Under this model masking pays only at the extremes. Under the stricter cache
+model it never pays at all: see Robustness below before relying on the positive
+rows.
 
 This is the mechanised form of Anthropic's own guidance for the context-editing
 beta: clear enough tokens to make the cache invalidation worthwhile.
 
-## Privacy
+## Robustness, and what this does not establish
+
+`robustness` attacks the tool's own output three ways. The results narrow the
+claim considerably and are the reason the headline below is stated the way it is.
+
+**The cost column is a simulation.** Only the baseline uses measured prefix
+sizes. Re-running it under the all-or-nothing invalidation actually observed on
+real traces, rather than generous longest-prefix matching, moves keeping the last
+tool result from +18.6% to -117.4%. The two models bracket the truth, because
+breakpoint-anchored matching with a 20-block lookback gives some partial reuse
+but not arbitrary reuse. So:
+
+- **Robust:** every policy retaining a meaningful amount of information costs
+  more than doing nothing. Negative under both models.
+- **Not established:** that aggressive masking saves anything. The sign depends
+  entirely on the cache assumption.
+
+**The estimator is not driving the sign.** Scaling every per-block estimate by 2x
+and 3x changes magnitudes and no signs.
+
+**Probes are clustered, not independent.** Probes inside one session share a
+trajectory and a mask boundary. A cluster bootstrap over 939 sessions puts
+keep-last-3 retention at 21.9% to 34.4%, so the loss is 66% to 78%, not a point
+value of 72%.
+
+**Not tested at all.** Whether a lost fact changes the outcome; retention is not
+task success. And whether an implementation that keeps originals retrievable
+recovers it, which most real tools do, so treating a mask as a deletion makes
+this an upper bound on harm rather than a measurement of it. It is also one
+developer's workload on one model family, which is the entire reason the binary
+exists.
 
 Probe tokens are literal strings lifted from tool output, so they can contain
 credentials, absolute paths, and client data. They are interned in memory and
