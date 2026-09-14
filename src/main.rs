@@ -233,28 +233,86 @@ fn cmd_probes(all: &[Session], max_df: usize, min_gap: usize) -> i32 {
         max_df
     );
     println!(
-        "gap from established to needed, in blocks: p50 {}  p90 {}  max {}\n",
+        "gap from established to needed, in blocks: p50 {}  p90 {}  max {}",
         gaps[gaps.len() / 2],
         gaps[gaps.len() * 9 / 10],
         gaps[gaps.len() - 1]
     );
+
+    // How deep into its session each reuse sits, counted in messages, which is where
+    // tier two cuts. It is reported because the two halves are not interchangeable:
+    // a replay of a shallow turn reproduces the trace far more often than a deep one,
+    // so tier two can only speak for the shallow half, and a retention figure that
+    // differs across the split is really two figures.
+    let mut depths: Vec<u32> = Vec::new();
+    for (s, ps) in sessions.iter().zip(&probes) {
+        for p in ps {
+            depths.push(s.blocks.get(p.use_at).map(|b| b.msg).unwrap_or(0));
+        }
+    }
+    depths.sort_unstable();
+    let median = depths[depths.len() / 2];
     println!(
-        "{:<20}{:>10}{:>12}{:>11}",
-        "policy", "probes", "destroyed", "retained"
+        "depth of the reuse, in messages: p50 {}  p90 {}  max {}\n",
+        median,
+        depths[depths.len() * 9 / 10],
+        depths[depths.len() - 1]
+    );
+
+    let split = |deep: bool| -> Vec<Vec<probes::Probe>> {
+        sessions
+            .iter()
+            .zip(&probes)
+            .map(|(s, ps)| {
+                ps.iter()
+                    .filter(|p| {
+                        let d = s.blocks.get(p.use_at).map(|b| b.msg).unwrap_or(0);
+                        if deep {
+                            d > median
+                        } else {
+                            d <= median
+                        }
+                    })
+                    .copied()
+                    .collect()
+            })
+            .collect()
+    };
+    let (shallow, deep) = (split(false), split(true));
+
+    println!(
+        "{:<20}{:>10}{:>12}{:>11}{:>13}{:>10}",
+        "policy", "probes", "destroyed", "retained", "shallow", "deep"
     );
     for pol in default_policies() {
         let (kept, total) = retention(&sessions, &probes, pol);
         if total == 0 {
             continue;
         }
+        let (sk, st) = retention(&sessions, &shallow, pol);
+        let (dk, dt) = retention(&sessions, &deep, pol);
+        let share = |k: u64, t: u64| {
+            if t == 0 {
+                "n/a".into()
+            } else {
+                pct(k as f64 / t as f64)
+            }
+        };
         println!(
-            "{:<20}{:>10}{:>12}{:>11}",
+            "{:<20}{:>10}{:>12}{:>11}{:>13}{:>10}",
             pol.label(),
             total,
             total - kept,
-            pct(kept as f64 / total as f64)
+            pct(kept as f64 / total as f64),
+            share(sk, st),
+            share(dk, dt)
         );
     }
+    println!("\nshallow = reuse at message {median} or earlier, deep = later. where the two");
+    println!("columns disagree, one retained figure is averaging two populations. tier two");
+    println!("replays a turn by cutting at its depth, and a replay agrees with the trace far");
+    println!("more often when the prefix is short, so the probes it can speak for come from");
+    println!("the shallow end of this distribution rather than from across it.");
     println!("\nretained = the fact was still literally present when the agent needed it.");
     println!("this measures information retention, not task success. losing a fact is not");
     println!("proof of failure: another valid route may exist.");

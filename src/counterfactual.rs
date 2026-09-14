@@ -99,6 +99,9 @@ pub struct Fact {
 /// observation. The facts are what that one observation is scored against.
 pub struct Case {
     pub session: usize,
+    /// Where the replay cuts, in messages, which is also how deep into its session
+    /// this turn sits. Depth decides whether a replay agrees with the trace at all,
+    /// and `probes` prints the distribution these are drawn from.
     pub cut: u32,
     pub model: String,
     pub facts: Vec<Fact>,

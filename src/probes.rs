@@ -1,6 +1,7 @@
 use crate::transcript::{Block, Kind, Role, Session};
 use std::collections::HashMap;
 
+#[derive(Clone, Copy)]
 pub struct Probe {
     pub tok: u32,
     pub origin: usize,
