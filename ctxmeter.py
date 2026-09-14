@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Measure what Claude Code actually bills you, from your own transcripts."""
-import argparse, collections, glob, json, os, statistics, sys
+import argparse, collections, glob, json, os, re, statistics, sys
 
 TRANSCRIPTS = os.path.expanduser("~/.claude/projects")
 IMG_SCALE = 0.35   # base64 length overstates image tokens ~2.85x; calibrated against usage records
@@ -162,12 +162,157 @@ def cmd_invalidation(root):
     print("\na median loss near a median prefix means invalidation is all-or-nothing,")
     print("which is what breakpoint-anchored matching with a 20-block lookback predicts.")
 
+
+CAND = re.compile(r"[A-Za-z0-9_./:-]{10,}")
+
+def candidates(text):
+    """Non-guessable identifiers: long, contains a digit, not a bare number."""
+    for m in CAND.finditer(text or ""):
+        t = m.group(0)
+        if any(c.isdigit() for c in t) and not t.replace(".", "").isdigit():
+            yield t
+
+def flatten(msgs):
+    """Ordered blocks: (role, type, tokens, text_body_or_empty)."""
+    out = []
+    for m in msgs:
+        role = m.get("role")
+        c = m.get("content")
+        if isinstance(c, str): c = [{"type": "text", "text": c}]
+        if not isinstance(c, list): continue
+        for b in c:
+            if not isinstance(b, dict): continue
+            t = b.get("type")
+            if t == "tool_result":
+                cc = b.get("content")
+                body = cc if isinstance(cc, str) else json.dumps(cc)
+            elif t == "text":
+                body = b.get("text") or ""
+            elif t == "tool_use":
+                body = json.dumps(b.get("input") or {})
+            else:
+                body = ""
+            out.append((role, t, block_tokens(b), body))
+    return out
+
+def harvest(sessions, max_df, min_gap):
+    """Probes derived from traces, never authored: a fact a tool result
+    established, that the agent demonstrably reused much later."""
+    df = collections.Counter()
+    for seq in sessions.values():
+        here = set()
+        for _, t, _, body in seq:
+            if t == "tool_result": here.update(candidates(body))
+        df.update(here)
+    rare = {t for t, n in df.items() if n <= max_df}
+
+    probes = {}
+    for f, seq in sessions.items():
+        origin, excluded, used = {}, set(), collections.defaultdict(list)
+        for i, (role, t, _, body) in enumerate(seq):
+            if t == "tool_result":
+                for tok in candidates(body):
+                    if tok in rare: origin.setdefault(tok, i)
+            elif role == "user" and t == "text":
+                excluded.update(candidates(body))
+            elif role == "assistant" and t in ("text", "tool_use"):
+                for tok in candidates(body):
+                    if tok in rare: used[tok].append(i)
+        got = [(tok, o, min(j for j in used[tok] if j >= o + min_gap))
+               for tok, o in origin.items()
+               if tok not in excluded and any(j >= o + min_gap for j in used[tok])]
+        if got: probes[f] = got
+    return probes
+
+def policies():
+    """Each returns which tool_result indices it removes from a live prefix."""
+    def keep_last(n):
+        return lambda live, size: set(live[:-n]) if len(live) > n else set()
+    def tail_budget(budget):
+        def p(live, size):
+            gone, run = set(), 0
+            for i in reversed(live):
+                run += size[i]
+                if run > budget: gone.add(i)
+            return gone
+        return p
+    return {"keep_last_3": keep_last(3), "keep_last_10": keep_last(10),
+            "keep_last_25": keep_last(25), "tail_budget_40k": tail_budget(40_000),
+            "tail_budget_100k": tail_budget(100_000)}
+
+def retention(probes, sessions, fn):
+    """(facts still present when needed, facts tested) under one policy."""
+    kept = total = 0
+    for f, ps in probes.items():
+        seq = sessions[f]
+        size = {i: b[2] for i, b in enumerate(seq)}
+        for tok, _, u in ps:
+            live = [i for i in range(u) if seq[i][1] == "tool_result"]
+            holders = [i for i in live if tok in seq[i][3]]
+            if not holders: continue
+            gone = fn(live, size)
+            total += 1
+            if any(i not in gone for i in holders): kept += 1
+    return kept, total
+
+def cmd_sensitivity(root):
+    """Widen the sample and check the policy ranking does not move."""
+    sessions = {f: flatten(m) for f, m in blocks(root)}
+    pol = policies()
+    print(f"{'rarity':>7}{'gap':>5}{'probes':>9}   " + "".join(f"{k:>18}" for k in pol))
+    orders = []
+    for max_df in (1, 3, 10):
+        for min_gap in (5, 20):
+            probes = harvest(sessions, max_df, min_gap)
+            n = sum(len(v) for v in probes.values())
+            if not n: continue
+            r = {}
+            for name, fn in pol.items():
+                kept, total = retention(probes, sessions, fn)
+                r[name] = kept / total if total else 0.0
+            orders.append((max_df, min_gap, tuple(sorted(r, key=lambda k: -r[k]))))
+            print(f"{max_df:>7}{min_gap:>5}{n:>9,}   " + "".join(f"{r[k]:>17.1%}" for k in pol))
+    base = orders[0][2]
+    moved = [o for o in orders if o[2] != base]
+    print(f"\npolicy ranking: {' > '.join(base)}")
+    if moved:
+        print(f"RANKING MOVED in {len(moved)} of {len(orders)} conditions. The result is scope-dependent.")
+        return 1
+    print(f"stable across all {len(orders)} conditions. widening the sample does not move the answer.")
+    return 0
+
+def cmd_probes(root, max_df=3, min_gap=5):
+    sessions = {f: flatten(m) for f, m in blocks(root)}
+    probes = harvest(sessions, max_df, min_gap)
+    n = sum(len(v) for v in probes.values())
+
+    print(f"sessions scanned {len(sessions):,}   yielding probes {len(probes):,}   probes {n:,}")
+    if n == 0:
+        print("\nNO PROBES HARVESTED. Loud failure by design: an empty denominator must")
+        print("never read as a pass. Relax rarity (max_df) or the gap (min_gap).")
+        return 1
+    gaps = sorted(u - o for v in probes.values() for _, o, u in v)
+    print(f"probes per scanned session {n/len(sessions):.2f}   (token appears in <= {max_df} sessions)")
+    print(f"gap from established to needed, in blocks: p50 {gaps[len(gaps)//2]:,}  "
+          f"p90 {gaps[int(len(gaps)*0.9)]:,}  max {gaps[-1]:,}\n")
+
+    print(f"{'policy':20}{'probes':>9}{'destroyed':>11}{'retained':>10}")
+    for name, fn in policies().items():
+        kept, total = retention(probes, sessions, fn)
+        if total:
+            print(f"{name:20}{total:>9,}{total-kept:>11,}{pct(kept/total):>10}")
+    print("\nretained = the fact was still literally present when the agent needed it.")
+    print("this measures information retention, not task success. losing a fact is not")
+    print("proof of failure: another valid route may exist. that is tier two's problem.")
+    return 0
+
 CMDS = {"summary": cmd_summary, "floor": cmd_floor,
-        "composition": cmd_composition, "invalidation": cmd_invalidation}
+        "composition": cmd_composition, "invalidation": cmd_invalidation,
+        "probes": cmd_probes, "sensitivity": cmd_sensitivity}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("command", choices=sorted(CMDS))
     ap.add_argument("--root", default=TRANSCRIPTS)
     a = ap.parse_args()
-    CMDS[a.command](a.root)
+    sys.exit(CMDS[a.command](a.root) or 0)

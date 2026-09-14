@@ -9,7 +9,55 @@ python3 ctxmeter.py summary        # cache hit rate, token classes, billed equiv
 python3 ctxmeter.py floor          # system prompt + tool definitions, by month
 python3 ctxmeter.py composition    # carry cost by content type
 python3 ctxmeter.py invalidation   # is cache invalidation partial or all-or-nothing
+python3 ctxmeter.py probes         # how much later-needed information each policy destroys
+python3 ctxmeter.py sensitivity    # does the policy ranking survive widening the sample
 ```
+
+## The probe benchmark
+
+Every context-compaction tool ships a token-savings number. None ships an
+information-loss number. `probes` measures the second one.
+
+Ground truth is not authored and no model is asked to judge. A probe is a
+distinctive identifier that a tool result established at block *i* and that the
+agent demonstrably reused at block *j*, far later. The fact that the agent used
+it is a mechanical property of the trace; the answer is the literal string. A
+model labelling its own recall would only measure imitation of the labeller.
+
+Rules the harvester enforces:
+
+- **Derived, never authored.** Probes come from the corpus. The command prints
+  sessions scanned against probes yielded, and exits non-zero on an empty
+  harvest, so a denominator that stopped growing cannot read as a pass.
+- **Non-guessable.** A probe token must be at least 10 characters, contain a
+  digit, and appear in at most `max_df` sessions corpus-wide.
+- **Not user-supplied.** Any token the user typed is excluded; recalling it is
+  not a memory test.
+- **A real gap.** The reuse must be at least `min_gap` blocks after the origin.
+
+It measures **information retention, not task success.** Losing a fact is not
+proof of failure, because another valid route may exist. Tier two, which asks
+whether a model can still answer once a fact was summarised rather than deleted,
+is where judging gets hard and is not built.
+
+### First result, 1,952 sessions, 7,530 probes
+
+| policy | facts retained when needed |
+|---|---|
+| keep last 3 tool results | 28.1% |
+| keep last 10 | 57.3% |
+| keep last 25 | 80.2% |
+| tail budget 40k tokens | 87.4% |
+| tail budget 100k tokens | 97.8% |
+
+Keeping the last three tool results is a shipped default. It destroys roughly
+72% of the information the agent went on to use.
+
+**Budget-based retention beats count-based, robustly.** A count policy cannot
+tell whether the fourth-from-last tool result is 50 tokens or 50,000. At
+`min_gap` 20 the count policies fall to 8-13% while the budget policies stay
+above 96%. `sensitivity` sweeps rarity and gap thresholds and exits non-zero if
+the ranking moves; across six conditions it does not.
 
 ## Why billed equivalents, not tokens
 
