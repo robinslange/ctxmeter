@@ -148,13 +148,35 @@ type Rebuilt = (
     HashMap<String, (String, String)>,
 );
 
+/// Every tool the request refers to, at any depth, in the order first seen.
+///
+/// A transcript can carry a tool_use inside a tool_result's content, and a definition list
+/// built by scanning only the top level will not know about it. The API then rejects the
+/// whole request for a reference it cannot resolve. Reading the list out of the request
+/// itself leaves the two nothing to disagree about.
+fn referenced_tools(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Array(a) => a.iter().for_each(|x| referenced_tools(x, out)),
+        serde_json::Value::Object(o) => {
+            if o.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                if let Some(n) = o.get("name").and_then(|n| n.as_str()) {
+                    if !out.iter().any(|x| x == n) {
+                        out.push(n.to_string());
+                    }
+                }
+            }
+            o.values().for_each(|x| referenced_tools(x, out));
+        }
+        _ => {}
+    }
+}
+
 /// Rebuild a valid Messages request from the transcript, cutting before the
 /// assistant turn we want the model to produce.
 fn rebuild(path: &Path, upto_msg: u32) -> Option<Rebuilt> {
     let f = File::open(path).ok()?;
     let mut seen: HashSet<String> = HashSet::new();
     let mut msgs: Vec<serde_json::Value> = Vec::new();
-    let mut tool_names: Vec<String> = Vec::new();
     // tool_use_id -> (tool name, the file path or command it targeted)
     let mut origin: HashMap<String, (String, String)> = HashMap::new();
     let mut idx: u32 = 0;
@@ -207,9 +229,6 @@ fn rebuild(path: &Path, upto_msg: u32) -> Option<Rebuilt> {
                         })
                         .unwrap_or_default();
                     origin.insert(id.to_string(), (name.to_string(), target));
-                    if !tool_names.iter().any(|n| n == name) {
-                        tool_names.push(name.to_string());
-                    }
                 }
             }
             if let Some(w) = whitelist(b) {
@@ -281,7 +300,11 @@ fn rebuild(path: &Path, upto_msg: u32) -> Option<Rebuilt> {
         return None;
     }
 
-    let tools = tool_names
+    let mut names: Vec<String> = Vec::new();
+    for m in &msgs {
+        referenced_tools(m, &mut names);
+    }
+    let tools = names
         .into_iter()
         .map(|n| {
             serde_json::json!({
@@ -841,6 +864,27 @@ fn show(label: &str, resp: &serde_json::Value) {
     );
 }
 
+/// Validate and measure every arm of every turn, for nothing, before a cent is spent.
+///
+/// It runs all of them even after one fails. Stopping at the first rejection leaves the
+/// rest unexamined and costs a second round trip through a human to find the next one,
+/// and the whole point of this pass is that finishing it is free.
+pub fn preflight(cases: &[Case], api_key: &str) -> (Vec<(u64, u64)>, Vec<String>) {
+    let mut sizes = Vec::new();
+    let mut errs = Vec::new();
+    for (i, c) in cases.iter().enumerate() {
+        let ctrl = count_tokens(api_key, &c.model, &c.messages_intact, &c.tools);
+        let treat = count_tokens(api_key, &c.model, &c.messages_masked, &c.tools);
+        for (arm, r) in [("control", &ctrl), ("treatment", &treat)] {
+            if let Err(e) = r {
+                errs.push(format!("turn {i} ({}) {arm} rejected: {e}", c.session));
+            }
+        }
+        sizes.push((*ctrl.as_ref().unwrap_or(&0), *treat.as_ref().unwrap_or(&0)));
+    }
+    (sizes, errs)
+}
+
 pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
     let mut v = Verdict {
         turns_attempted: 0,
@@ -857,27 +901,11 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
         errors: Vec::new(),
         measured_tokens: 0,
     };
-    // Every arm of every case first, for nothing. It rejects a malformed rebuild
-    // before the money rather than after it, and it prices the run from the
-    // tokenizer instead of from a guess about it.
-    let mut sizes: Vec<(u64, u64)> = Vec::new();
-    for (i, c) in cases.iter().enumerate() {
-        let ctrl = match count_tokens(api_key, &c.model, &c.messages_intact, &c.tools) {
-            Ok(n) => n,
-            Err(e) => {
-                v.errors.push(format!("case {i} control rejected: {e}"));
-                return v;
-            }
-        };
-        let treat = match count_tokens(api_key, &c.model, &c.messages_masked, &c.tools) {
-            Ok(n) => n,
-            Err(e) => {
-                v.errors.push(format!("case {i} treatment rejected: {e}"));
-                return v;
-            }
-        };
-        v.measured_tokens += ctrl + treat;
-        sizes.push((ctrl, treat));
+    let (sizes, errs) = preflight(cases, api_key);
+    v.measured_tokens = sizes.iter().map(|(a, b)| a + b).sum();
+    if !errs.is_empty() {
+        v.errors = errs;
+        return v;
     }
     let ceiling: f64 = cases
         .iter()
@@ -1358,6 +1386,27 @@ mod tests {
         // Names no file, so it yields no target and the case is dropped.
         assert_eq!(file_in("cd /home/dev/monorepo/notes && ls"), None);
         assert_eq!(file_in("pnpm test"), None);
+    }
+
+    /// The 400 that stopped a real run before a cent was spent: a tool_use nested inside a
+    /// tool_result's content is a reference the API resolves, and a list built by scanning
+    /// the top level alone does not contain it.
+    #[test]
+    fn a_tool_named_only_inside_a_result_is_still_declared() {
+        let msgs = serde_json::json!([
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "tool_use", "id": "t2", "name": "SendMessage", "input": {}}
+                ]}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {}}
+            ]}
+        ]);
+        let mut names = Vec::new();
+        referenced_tools(&msgs, &mut names);
+        assert!(names.contains(&"SendMessage".to_string()), "got {names:?}");
+        assert!(names.contains(&"Read".to_string()), "got {names:?}");
     }
 
     /// A redirect sink is in every second command, so matching one would score

@@ -70,6 +70,10 @@ enum Cmd {
         /// Required to spend money.
         #[arg(long)]
         yes: bool,
+        /// Send every arm to the free token-counting endpoint and stop. Proves the API
+        /// accepts what was rebuilt, and prices the run from the tokenizer, for nothing.
+        #[arg(long)]
+        preflight: bool,
         /// Print the fact under test and each raw response, so the verdict can be
         /// checked by eye instead of taken on trust. This prints probe text,
         /// which every other command deliberately does not.
@@ -317,6 +321,7 @@ struct CfArgs {
     sample: usize,
     dry_run: bool,
     yes: bool,
+    preflight: bool,
     show_raw: bool,
     max_df: usize,
     min_gap: usize,
@@ -455,6 +460,28 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
         eprintln!("Anthropic's terms do not permit using Free, Pro or Max OAuth tokens in");
         eprintln!("another tool, so ctxmeter will not read them.");
         return 2;
+    }
+    if a.preflight {
+        let (sizes, errs) = counterfactual::preflight(&cases, &key);
+        let measured: u64 = sizes.iter().map(|(x, y)| x + y).sum();
+        println!(
+            "\nmeasured {measured} input tokens across both arms of {} turns",
+            cases.len()
+        );
+        if errs.is_empty() {
+            println!("every arm was accepted. nothing was spent.");
+            return 0;
+        }
+        eprintln!(
+            "\n{} of {} arms would be rejected:",
+            errs.len(),
+            cases.len() * 2
+        );
+        for e in &errs {
+            eprintln!("  {e}");
+        }
+        eprintln!("\nnothing was spent. these are bugs in the rebuild, not results.");
+        return 3;
     }
     if !a.yes {
         eprintln!("\nRefusing to spend ${cost:.2} without --yes.");
@@ -700,6 +727,7 @@ fn main() {
             sample,
             dry_run,
             yes,
+            preflight,
             show_raw,
             max_df,
             min_gap,
@@ -712,6 +740,7 @@ fn main() {
                 sample,
                 dry_run,
                 yes,
+                preflight,
                 show_raw,
                 max_df,
                 min_gap,
