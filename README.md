@@ -1,252 +1,246 @@
 # ctxmeter
 
-Measures what Claude Code actually bills you, from your own transcripts in `~/.claude/projects`.
+Your coding agent writes a billing record for every request it makes. ctxmeter
+reads it, and tells you two things nobody else will: what you are actually paying
+for, and what a context-compaction tool would destroy to save you money.
 
-No API calls, no proxy, no config, and nothing leaves your machine. Reads the `usage`
-records the CLI already writes.
+Offline by default. Nothing leaves your machine.
+
+## Why you might want this
+
+There is a growing class of tools that shrink an agent's context to cut your
+token bill. They advertise a savings number: 40 to 70 percent fewer tokens, 20
+percent for coding agents, same answers.
+
+None of them advertise an information-loss number. Compaction is lossy by
+construction, so there is one, and it is measurable.
+
+There is also a good chance you are optimising the wrong thing. If prompt
+caching is already working for you, a compression proxy is fighting over a small
+remainder, and it can lose: editing context mid-conversation turns cheap cache
+reads into expensive writes, and a tool that counts tokens sent rather than
+dollars billed will report that as a win.
+
+ctxmeter measures all of it against your own sessions.
+
+## Install
+
+Prebuilt binaries for macOS and Linux are attached to each
+[release](https://github.com/robinslange/ctxmeter/releases):
 
 ```bash
-cargo build --release
-./target/release/ctxmeter summary      # cache hit rate, token classes, billed equivalents
-./target/release/ctxmeter floor        # system prompt + tool definitions, by month
-./target/release/ctxmeter probes       # how much later-needed information each policy destroys
-./target/release/ctxmeter sensitivity  # does the policy ranking survive widening the sample
-./target/release/ctxmeter tradeoff     # what each policy saves against what it destroys
-./target/release/ctxmeter robustness   # does the conclusion survive its own assumptions
-./target/release/ctxmeter counterfactual --dry-run   # does a lost fact change what the agent does
+# pick your platform, verify, run
+tar xzf ctxmeter-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c ctxmeter-aarch64-apple-darwin.tar.gz.sha256
+./ctxmeter-aarch64-apple-darwin/ctxmeter summary
 ```
 
-Everything except `counterfactual` is offline. Prebuilt binaries for macOS and
-Linux are attached to each release.
-
-`ctxmeter.py` is kept as a reference implementation. The Rust binary is what you
-distribute; the Python is what you check it against.
+Or build it:
 
 ```bash
-python3 ctxmeter.py summary        # cache hit rate, token classes, billed equivalents
-python3 ctxmeter.py floor          # system prompt + tool definitions, by month
-python3 ctxmeter.py composition    # carry cost by content type
-python3 ctxmeter.py invalidation   # is cache invalidation partial or all-or-nothing
-python3 ctxmeter.py probes         # how much later-needed information each policy destroys
-python3 ctxmeter.py sensitivity    # does the policy ranking survive widening the sample
+cargo install --git https://github.com/robinslange/ctxmeter
 ```
 
-## The probe benchmark
+It reads `~/.claude/projects` by default. Point it elsewhere with `--root`.
 
-Every context-compaction tool ships a token-savings number. None ships an
-information-loss number. `probes` measures the second one.
+## Start here
 
-Ground truth is not authored and no model is asked to judge. A probe is a
-distinctive identifier that a tool result established at block *i* and that the
-agent demonstrably reused at block *j*, far later. The fact that the agent used
-it is a mechanical property of the trace; the answer is the literal string. A
-model labelling its own recall would only measure imitation of the labeller.
+```bash
+ctxmeter summary
+```
 
-Rules the harvester enforces:
+You get your cache hit rate, where your input tokens go, and how much prompt
+caching is already saving you. If that last number is high, read it as a warning:
+the savings a compaction tool is selling you have largely been collected.
 
-- **Derived, never authored.** Probes come from the corpus. The command prints
-  sessions scanned against probes yielded, and exits non-zero on an empty
-  harvest, so a denominator that stopped growing cannot read as a pass.
-- **Non-guessable.** A probe token must be at least 10 characters, contain a
-  digit, and appear in at most `max_df` sessions corpus-wide.
-- **Not user-supplied.** Any token the user typed is excluded; recalling it is
-  not a memory test.
-- **A real gap.** The reuse must be at least `min_gap` blocks after the origin.
+## The commands
 
-It measures **information retention, not task success.** Losing a fact is not
-proof of failure, because another valid route may exist. Tier two, which asks
-whether a model can still answer once a fact was summarised rather than deleted,
-is where judging gets hard and is not built.
-
-### First result, 1,952 sessions, 7,530 probes
-
-| policy | facts retained when needed |
+| Command | What it answers |
 |---|---|
-| keep last 3 tool results | 28.1% |
-| keep last 10 | 57.3% |
-| keep last 25 | 80.2% |
-| tail budget 40k tokens | 87.4% |
-| tail budget 100k tokens | 97.8% |
+| `summary` | What am I paying for, and how much has caching already saved? |
+| `floor` | How big is my system prompt plus tool definitions, and is it growing? |
+| `probes` | How much later-needed information does each retention policy destroy? |
+| `tradeoff` | What does each policy save, set against what it destroys? |
+| `sensitivity` | Does the policy ranking survive widening the sample? |
+| `robustness` | Does any of this survive its own assumptions? |
+| `counterfactual` | When a fact is destroyed, does the agent actually change course? |
 
-Keeping the last three tool results is a shipped default. It destroys roughly
-72% of the information the agent went on to use.
+Everything except `counterfactual` is offline and free.
 
-**Budget-based retention beats count-based, robustly.** A count policy cannot
-tell whether the fourth-from-last tool result is 50 tokens or 50,000. At
-`min_gap` 20 the count policies fall to 8-13% while the budget policies stay
-above 96%. `sensitivity` sweeps rarity and gap thresholds and exits non-zero if
-the ranking moves; across six conditions it does not.
+**If you are reading someone else's measurements, run `robustness` first.** It
+attacks the tool's own output three ways: swap the cache model, scale the token
+estimator, and replace point estimates with confidence intervals clustered by
+session. It is the command most likely to tell you a headline is overstated,
+including the ones in this README.
 
-## Why billed equivalents, not tokens
+## How to read the numbers
 
-Input cost is `fresh + 1.25 x cache_write + 0.10 x cache_read`, in multiples of base input
-price. Expressing cost this way is model-independent on the input side and makes the trap
-visible: on a cached workload, tokens sent and dollars billed move in **opposite**
-directions. A compressor that removes 40% of tokens while breaking the prefix converts
-reads at 0.10x into fresh input at 1.00x, and reports a win.
+**Billed equivalents.** Input cost is `fresh + 1.25 x cache_write + 0.10 x
+cache_read`, expressed in multiples of the base input price. Stating cost this
+way is model-independent, and it makes the central trap visible: on a cached
+workload, tokens sent and dollars billed move in opposite directions. Removing
+40 percent of your tokens while breaking the cache prefix converts reads at 0.10x
+into fresh input at 1.00x.
 
-Never trust a tool's own "tokens saved" dashboard. Read `cache_read_input_tokens` and
-`cache_creation_input_tokens` back from the response.
+Never trust a tool's own "tokens saved" dashboard. Read
+`cache_read_input_tokens` and `cache_creation_input_tokens` back out of the API
+response, which is what ctxmeter does.
 
-## Measurement traps this tool avoids
+**The floor.** Your system prompt and tool definitions are sent ahead of the
+messages on every single request, and no context policy can touch them without
+breaking the agent. `floor` approximates them from the first billed prefix of
+each session. It also tracks them by month, because this number grows quietly as
+plugins and tool servers accumulate.
 
-Each of these produced a wrong answer before it was caught.
+Tool definitions never appear in a transcript, so the floor cannot be attributed
+from logs. Change one config item, start a fresh session, and re-run.
 
-- **Image payloads.** Transcripts store images as base64, but the API prices them by pixel
-  area. Counting base64 length overstates image-bearing content by ~2.85x, calibrated
-  against usage records. `IMG_SCALE` corrects it.
-- **Thinking signatures.** Thinking blocks carry a long opaque `signature` field. Counting
-  it produced a spurious 24.7% cost line for content that is metadata. Only `thinking` text
-  is counted.
-- **Visible content is not the bill.** Estimated conversation content is about 0.32 of the
-  real billed prefix. Any saving expressed as a fraction of visible content overstates by
-  roughly 3x. `composition` prints the calibration ratio so the gap stays in view.
-- **Two dedup keys.** Usage rows dedupe on `requestId` + `message.id`; content blocks dedupe
-  on `uuid`. They yield different turn counts. Do not mix the two in one ratio.
-- **The floor is invisible.** Tool definitions never appear in a transcript, so the floor
-  cannot be attributed from logs. Change one config item, start a fresh session, and read
-  the first-turn prefix back.
+**Retention.** `probes` reports the share of later-needed facts still present
+when the agent reached for them. A probe is a distinctive identifier that a tool
+result established, and that the agent demonstrably reused much later. Retention
+measures information survival, not task success.
 
-## What it found here
+## Tier two: did losing it matter?
 
-- Prompt caching already saves 86.9% against a no-cache counterfactual, at a 97.3% hit rate.
-- Cache reads are 74% of the remaining input bill.
-- The fixed floor is 50,171 tokens median, about 38% of a median prefix, re-read every turn,
-  and up 73% in two months as plugins accumulated.
-- Invalidation is all-or-nothing: 98.7% of turn pairs are clean incremental hits, and the
-  rest lose a median 148,152 tokens, roughly a whole prefix. That is what breakpoint-anchored
-  matching with a 20-block lookback predicts, and it means mid-history edits rarely pay.
-
-
-## Parity
-
-The Rust binary and the Python reference are checked against each other on the
-same corpus. `summary` agrees exactly. `probes` agrees within one point on every
-policy and gives the identical ranking; the small gap is deliberate, because the
-Rust build tests exact identifier membership per block where the Python tests
-substring containment.
-
-| policy | Rust | Python |
-|---|---|---|
-| keep last 3 | 27.6% | 28.1% |
-| keep last 10 | 56.2% | 57.4% |
-| keep last 25 | 79.2% | 80.2% |
-| tail budget 40k | 87.1% | 87.4% |
-| tail budget 100k | 97.9% | 97.8% |
-
-Full corpus, 2,485 sessions: 3.9s in Rust against 15.9s in Python. The reason to
-ship the Rust build is not speed, it is that replicating a finding should cost a
-stranger one command and no language runtime.
-
-## The tradeoff
-
-`tradeoff` reports both numbers from the same policy applied the same way. Cost is
-grounded in the real prefix sizes from the usage records, so the system prompt and
-tool definitions are carried unchanged: no context policy can touch them.
-
-| policy | cost saved | info retained |
-|---|---:|---:|
-| keep last 1 | +18.6% | 5.1% |
-| keep last 3 | +11.0% | 27.6% |
-| keep last 5 | +4.1% | 38.8% |
-| keep last 10 | -10.9% | 56.2% |
-| keep last 25 | -39.2% | 79.2% |
-| keep last 50 | -59.7% | 91.8% |
-| tail budget 10k | -9.0% | 53.0% |
-| tail budget 40k | -30.3% | 87.1% |
-| tail budget 100k | -8.8% | 97.9% |
-| tail budget 200k | +0.7% | 99.9% |
-
-Every policy that retains a meaningful amount of information costs **more** than
-doing nothing. The mechanism: once the mask boundary advances, the whole kept
-region is re-written at 1.25x instead of read at 0.10x, so the penalty is roughly
-how often it fires multiplied by how much it keeps. That product peaks in the
-middle, which is why 40k is worse than both 10k and 100k.
-
-Under this model masking pays only at the extremes. Under the stricter cache
-model it never pays at all: see Robustness below before relying on the positive
-rows.
-
-This is the mechanised form of Anthropic's own guidance for the context-editing
-beta: clear enough tokens to make the cache invalidation worthwhile.
-
-## Tier two: does a lost fact change what the agent does?
-
-Retention measures whether information survived. It does not measure whether
-losing it mattered. `counterfactual` measures the second thing without asking a
-model to grade itself.
+`counterfactual` measures whether a destroyed fact changes what the agent does,
+without asking a model to grade itself.
 
 At the block where the agent reused a fact, it had already produced that fact
 from that context. So replay that exact turn twice, once with the context intact
 and once with the policy applied, and check whether the literal string comes
-back. The task is the agent's own next action; the ground truth is what it
+back. The task is the agent's own next action. The ground truth is what it
 actually did.
 
-The intact arm is the control. If it fails to reproduce the fact, the probe
+The intact arm is the control. If it fails to reproduce the fact, that probe
 cannot say anything about the policy, so it is discarded and the discard rate is
 printed. Of the cases that survive, the outcome splits three ways:
 
 - **Reproduced anyway.** The model did not need the context to get there.
 - **Went to fetch it.** It noticed something was missing. The healthy failure.
-- **Neither.** The fact was gone and the model did not ask for it. This is the
-  irreversible share.
+- **Neither.** The fact was gone and the model did not ask for it back.
 
 ```bash
-ctxmeter counterfactual --dry-run --sample 40    # builds and prices every request, sends nothing
+ctxmeter counterfactual --dry-run --sample 40   # builds and prices every request, sends nothing
 ANTHROPIC_API_KEY=... ctxmeter counterfactual --sample 40 --yes
 ```
 
-Two calls per case at full session length, so it is not cheap. The dry run prints
-the estimate before you spend anything, and spending needs `--yes`.
+Two calls per case at full session length, so this is not cheap. The dry run
+prints the estimate first, and spending requires `--yes`.
 
-It requires a real API key and will not read a Claude subscription credential,
+It needs a real API key. It will not read a Claude subscription credential,
 because Anthropic's terms do not permit using Free, Pro or Max OAuth tokens in
-another tool. If you keep keys in 1Password, pass it without writing it to disk:
+another tool. If you keep keys in a password manager, pass it without writing it
+to disk:
 
 ```bash
 ANTHROPIC_API_KEY="$(op read 'op://YourVault/Anthropic/credential')" \
   ctxmeter counterfactual --sample 40 --yes
 ```
 
-Known limits of the rebuild: the system prompt and the real tool definitions are
-not recorded in a transcript, so tool schemas are synthesised from the calls the
-session actually made and are permissive. Thinking blocks are dropped, since
-their signatures will not validate in a fresh request. Both make this an
-approximation of the original turn, not a replay of it.
+## What this does not establish
 
-## Robustness, and what this does not establish
+Read this before quoting any number it gives you.
 
-`robustness` attacks the tool's own output three ways. The results narrow the
-claim considerably and are the reason the headline below is stated the way it is.
+**That a lost fact is a failed task.** Retention is not success. The agent may
+have had another valid route to the answer. Establishing harm needs a restore
+counterfactual, and `counterfactual` is only an approximation of one.
 
-**The cost column is a simulation.** Only the baseline uses measured prefix
-sizes. Re-running it under the all-or-nothing invalidation actually observed on
-real traces, rather than generous longest-prefix matching, moves keeping the last
-tool result from +18.6% to -117.4%. The two models bracket the truth, because
-breakpoint-anchored matching with a 20-block lookback gives some partial reuse
-but not arbitrary reuse. So:
+**That real tools destroy as much as a bare policy does.** Most keep originals
+retrievable, so treating a mask as a deletion is an upper bound on harm rather
+than a measurement of it. The other half of that: a model which has lost a fact
+does not know to ask for it back.
 
-- **Robust:** every policy retaining a meaningful amount of information costs
-  more than doing nothing. Negative under both models.
-- **Not established:** that aggressive masking saves anything. The sign depends
-  entirely on the cache assumption.
+**That the cost column is a measurement.** Only the baseline uses measured
+prefix sizes. Every policy figure is simulated, and its sign can depend on cache
+behaviour no external party can observe. `robustness` runs it under two models
+that bracket the real thing, and where they disagree, the honest answer is that
+the question is open.
 
-**The estimator is not driving the sign.** Scaling every per-block estimate by 2x
-and 3x changes magnitudes and no signs.
+**That anyone's numbers transfer to you.** Workload shape decides almost
+everything here. That is the whole reason this is a binary you can run rather
+than a blog post you have to believe.
 
-**Probes are clustered, not independent.** Probes inside one session share a
-trajectory and a mask boundary. A cluster bootstrap over 939 sessions puts
-keep-last-3 retention at 21.9% to 34.4%, so the loss is 66% to 78%, not a point
-value of 72%.
+Known limits of the tier-two rebuild: the system prompt and real tool schemas are
+not recorded in a transcript, so schemas are synthesised from the calls a session
+actually made and are permissive. Thinking blocks are dropped, because their
+signatures will not validate in a fresh request.
 
-**Not tested at all.** Whether a lost fact changes the outcome; retention is not
-task success. And whether an implementation that keeps originals retrievable
-recovers it, which most real tools do, so treating a mask as a deletion makes
-this an upper bound on harm rather than a measurement of it. It is also one
-developer's workload on one model family, which is the entire reason the binary
-exists.
+## How it avoids the usual measurement mistakes
 
-Probe tokens are literal strings lifted from tool output, so they can contain
-credentials, absolute paths, and client data. They are interned in memory and
-never printed. Every command emits aggregate numbers only. Nothing is written
-anywhere except stdout.
+Each of these produced a wrong answer during development before it was caught.
+They are documented because they are easy to repeat.
+
+- **Image payloads.** Transcripts store images as base64, but the API prices them
+  by pixel area. Counting base64 length overstated image-bearing content by about
+  2.85x against usage records.
+- **Thinking signatures.** Thinking blocks carry a long opaque signature.
+  Counting it invented a 24.7 percent cost line for pure metadata.
+- **Visible content is not the bill.** Estimated conversation content came to
+  roughly a third of the real billed prefix. Any saving expressed as a share of
+  visible content overstates by about 3x, so cost is grounded in real prefix
+  sizes instead.
+- **Mismatched denominators.** Usage rows deduplicate on request and message id;
+  content blocks deduplicate on uuid. They give different turn counts, and mixing
+  them in one ratio is wrong.
+- **Probes must be derived, never authored.** They come out of your corpus.
+  `probes` prints sessions scanned against probes yielded and exits non-zero on
+  an empty harvest, because a denominator that has stopped growing must not read
+  as a pass.
+- **Probes are clustered, not independent.** Probes inside one session share a
+  trajectory and a mask boundary. Intervals come from a bootstrap over sessions,
+  not over probes.
+- **A grader would measure the grader.** Ground truth never comes from a model's
+  output. It is a literal string from your trace and an observed reuse.
+
+## Privacy
+
+Probe tokens are literal strings lifted from tool output, which means they can
+carry credentials, absolute paths and client data. They are interned in memory
+and never printed. Every command emits aggregate numbers only, to stdout, and
+writes nothing.
+
+`counterfactual` is the single exception, and it is opt-in: it sends
+reconstructed context to the Anthropic API, using your key. The dry run sends
+nothing at all.
+
+## Results from one workload
+
+These come from the author's own 2,485 sessions on Opus-class and Sonnet-class
+models. They are an example of what the tool reports, not a claim about yours.
+
+Prompt caching was already saving 86.9 percent against a no-cache counterfactual
+at a 97.3 percent hit rate, and cache reads were 74 percent of the remaining
+input bill. The fixed prefix was 50,171 tokens at the median, roughly 38 percent
+of every request, and it had grown 73 percent in two months.
+
+Against 7,212 probes across 939 sessions, retention by policy:
+
+| policy | information retained | cost saved (simulated) |
+|---|---:|---:|
+| keep last 1 tool result | 5.1% | +18.7% |
+| keep last 3 | 27.6% | +11.1% |
+| keep last 10 | 56.2% | -10.9% |
+| keep last 50 | 91.8% | -60.3% |
+| tail budget 40k tokens | 87.1% | -30.1% |
+| tail budget 100k tokens | 97.8% | -8.8% |
+
+Two things fall out. Every policy that retained a meaningful share of information
+cost more than doing nothing. And budget-based retention beat count-based
+retention everywhere, because a count cannot tell whether the fourth-from-last
+tool result is fifty tokens or fifty thousand.
+
+The positive rows in that table do not survive `robustness`. Under the
+all-or-nothing cache invalidation observed on the same traces, keeping the last
+tool result moves from +18.7 percent to -117 percent. Which is the point of
+having the command.
+
+## Contributing
+
+Bug reports about the measurement method are more welcome than feature requests.
+If ctxmeter tells you something that looks wrong, that is worth an issue.
+
+`ctxmeter.py` is a reference implementation kept for cross-checking the Rust.
+`cargo test` covers the identifier rules and the token accounting; CI runs the
+binary against a synthetic transcript in `tests/fixture`.
+
+MIT licensed.
