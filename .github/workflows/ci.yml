@@ -24,6 +24,11 @@ jobs:
   smoke:
     # Compiling proves nothing about the reader. Run the binary against a
     # synthetic transcript and check it produces the numbers we expect.
+    #
+    # tests/corpus is frozen and read by nothing else. The unit fixtures in
+    # tests/fixture grow and change as tests need them, and every command here
+    # reports over a whole directory, so sharing one would make an exact count
+    # break whenever someone added a fixture.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -32,7 +37,7 @@ jobs:
       - run: cargo build --release
       - name: summary reads the fixture
         run: |
-          out=$(./target/release/ctxmeter summary --root tests/fixture)
+          out=$(./target/release/ctxmeter summary --root tests/corpus)
           echo "$out"
           echo "$out" | grep -q "turns 4" || { echo "expected 4 turns"; exit 1; }
           echo "$out" | grep -q "cache hit rate" || exit 1
@@ -40,11 +45,11 @@ jobs:
         run: |
           # A denominator that stops growing must not read as a pass.
           set +e
-          ./target/release/ctxmeter probes --root tests/fixture --max-df 0
+          ./target/release/ctxmeter probes --root tests/corpus --max-df 0
           code=$?
           set -e
           test "$code" -eq 1 || { echo "expected exit 1 on empty harvest, got $code"; exit 1; }
       - name: counterfactual never sends anything on a dry run
         run: |
           ANTHROPIC_API_KEY= ./target/release/ctxmeter counterfactual \
-            --root tests/fixture --dry-run --sample 2 || true
+            --root tests/corpus --dry-run --sample 2 || true
