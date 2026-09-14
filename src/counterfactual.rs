@@ -23,6 +23,8 @@ use std::process::Command;
 /// measurement is running: telling the model it is in an experiment is a reason for it to
 /// go looking for what vanished, and "went to fetch it" is one of the outcomes being
 /// counted.
+static EMPTY_IDS: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
+
 const MASK: &str = "[tool output cleared to reclaim context]";
 
 /// Published input/output prices per million tokens, checked 2026-09-14.
@@ -158,11 +160,17 @@ fn referenced_tools(v: &serde_json::Value, out: &mut Vec<String>) {
     match v {
         serde_json::Value::Array(a) => a.iter().for_each(|x| referenced_tools(x, out)),
         serde_json::Value::Object(o) => {
-            if o.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                if let Some(n) = o.get("name").and_then(|n| n.as_str()) {
-                    if !out.iter().any(|x| x == n) {
-                        out.push(n.to_string());
-                    }
+            // A tool_use names a tool in `name`; a tool_reference, which a transcript
+            // can nest inside a tool_result, names one in `tool_name`. The API resolves
+            // both against the same list.
+            let named = match o.get("type").and_then(|t| t.as_str()) {
+                Some("tool_use") => o.get("name"),
+                Some("tool_reference") => o.get("tool_name"),
+                _ => None,
+            };
+            if let Some(n) = named.and_then(|n| n.as_str()) {
+                if !out.iter().any(|x| x == n) {
+                    out.push(n.to_string());
                 }
             }
             o.values().for_each(|x| referenced_tools(x, out));
@@ -242,24 +250,52 @@ fn rebuild(path: &Path, upto_msg: u32) -> Option<Rebuilt> {
 
     // Every tool_use needs its result in the same request, and the array must
     // open on a user turn. Trim from both ends until both hold.
-    let mut have: HashSet<String> = HashSet::new();
-    for m in &msgs {
-        for b in m["content"].as_array()? {
-            if b["type"] == "tool_result" {
-                if let Some(id) = b["tool_use_id"].as_str() {
-                    have.insert(id.to_string());
-                }
-            }
-        }
-    }
-    // A tool_use whose result was never recorded invalidates the whole request, not
-    // just the block, and the API rejects all of it. Drop the block and keep the
-    // rest of the turn, which is still what the agent did. A message left with no
-    // content goes with it.
-    for m in &mut msgs {
-        if let Some(arr) = m["content"].as_array_mut() {
-            arr.retain(|b| {
-                b["type"] != "tool_use" || b["id"].as_str().is_some_and(|i| have.contains(i))
+    // The API's rule is adjacency: a tool_use must be answered by a tool_result in the
+    // very next message, not merely somewhere later. On this corpus 7.8% of tool_use
+    // messages break that, on the main thread, because a turn can be split or a person
+    // can type while tools are still running. A call and its answer survive together or
+    // not at all; a message left with no content goes too.
+    let answered: Vec<HashSet<String>> = (0..msgs.len())
+        .map(|i| {
+            msgs.get(i + 1)
+                .and_then(|m| m["content"].as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter(|b| b["type"] == "tool_result")
+                        .filter_map(|b| b["tool_use_id"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+    let kept_uses: Vec<HashSet<String>> = (0..msgs.len())
+        .map(|i| {
+            msgs[i]["content"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter(|b| b["type"] == "tool_use")
+                        .filter_map(|b| b["id"].as_str())
+                        .filter(|id| answered[i].contains(*id))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+    for i in 0..msgs.len() {
+        let prev: &HashSet<String> = if i == 0 {
+            &EMPTY_IDS
+        } else {
+            &kept_uses[i - 1]
+        };
+        if let Some(arr) = msgs[i]["content"].as_array_mut() {
+            arr.retain(|b| match b["type"].as_str() {
+                Some("tool_use") => b["id"].as_str().is_some_and(|id| kept_uses[i].contains(id)),
+                Some("tool_result") => b["tool_use_id"]
+                    .as_str()
+                    .is_some_and(|id| prev.contains(id)),
+                _ => true,
             });
         }
     }
@@ -268,16 +304,7 @@ fn rebuild(path: &Path, upto_msg: u32) -> Option<Rebuilt> {
     // prefill, which these models reject outright, and it is also where a
     // tool_use whose result we cut lands. One condition covers both.
     while let Some(last) = msgs.last() {
-        let dangling = last["content"]
-            .as_array()
-            .map(|a| {
-                a.iter().any(|b| {
-                    b["type"] == "tool_use"
-                        && b["id"].as_str().map(|i| !have.contains(i)).unwrap_or(false)
-                })
-            })
-            .unwrap_or(false);
-        if dangling || last["role"] != "user" {
+        if last["role"] != "user" {
             msgs.pop();
         } else {
             break;
@@ -539,24 +566,35 @@ pub fn invalid(msgs: &[serde_json::Value]) -> Option<String> {
     if msgs.last()?["role"] != "user" {
         return Some("ends on an assistant turn, which is a prefill".into());
     }
-    let mut uses: HashSet<&str> = HashSet::new();
-    let mut results: HashSet<&str> = HashSet::new();
-    for m in msgs {
-        for b in m["content"].as_array().into_iter().flatten() {
-            match b["type"].as_str() {
-                Some("tool_use") => uses.insert(b["id"].as_str().unwrap_or("")),
-                Some("tool_result") => results.insert(b["tool_use_id"].as_str().unwrap_or("")),
-                _ => continue,
-            };
+    let ids = |m: Option<&serde_json::Value>, kind: &str, field: &str| -> HashSet<String> {
+        m.and_then(|m| m["content"].as_array())
+            .map(|a| {
+                a.iter()
+                    .filter(|b| b["type"] == kind)
+                    .filter_map(|b| b[field].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // Adjacency, not mere presence: the API requires a tool_result in the very next
+    // message, and a request whose answer arrives two messages later is rejected whole.
+    for i in 0..msgs.len() {
+        let uses = ids(msgs.get(i), "tool_use", "id");
+        let answers = ids(msgs.get(i + 1), "tool_result", "tool_use_id");
+        if let Some(id) = uses.difference(&answers).next() {
+            return Some(format!("tool_use {id} is not answered by the next message"));
         }
-    }
-    if let Some(id) = uses.difference(&results).next() {
-        return Some(format!("tool_use {id} has no result"));
-    }
-    if let Some(id) = results.difference(&uses).next() {
-        return Some(format!(
-            "tool_result answers {id}, which is not in the request"
-        ));
+        let results = ids(msgs.get(i), "tool_result", "tool_use_id");
+        let prev = if i == 0 {
+            HashSet::new()
+        } else {
+            ids(msgs.get(i - 1), "tool_use", "id")
+        };
+        if let Some(id) = results.difference(&prev).next() {
+            return Some(format!(
+                "tool_result answers {id}, which the previous message does not call"
+            ));
+        }
     }
     None
 }
@@ -1407,6 +1445,36 @@ mod tests {
         referenced_tools(&msgs, &mut names);
         assert!(names.contains(&"SendMessage".to_string()), "got {names:?}");
         assert!(names.contains(&"Read".to_string()), "got {names:?}");
+    }
+
+    /// Both 400s that stopped a real run, neither of which the old invariants could see.
+    /// A tool_reference is its own block type naming its tool in `tool_name`, and the API
+    /// wants a tool_result in the very NEXT message, not merely somewhere later.
+    #[test]
+    fn a_request_must_declare_what_it_references_and_answer_calls_immediately() {
+        let mut names = Vec::new();
+        referenced_tools(
+            &serde_json::json!([{"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "tool_reference", "tool_name": "SendMessage"}
+            ]}]),
+            &mut names,
+        );
+        assert_eq!(
+            names,
+            ["SendMessage"],
+            "a nested tool_reference went undeclared"
+        );
+
+        let late = serde_json::json!([
+            {"role": "user", "content": [{"type": "text", "text": "go"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "still working"}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "x"}]}
+        ]);
+        assert!(
+            invalid(late.as_array().unwrap()).is_some(),
+            "an answer two messages later must not pass"
+        );
     }
 
     /// A redirect sink is in every second command, so matching one would score
