@@ -472,13 +472,20 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
         if attempted == 0 {
             return 3;
         }
-        eprintln!("{attempted} case(s) completed before it, reported below.");
+        eprintln!("{attempted} turn(s) completed before it, reported below.");
     }
     println!("\n{:<30}{:>8}", "turns replayed", v.turns_attempted);
     println!("{:<30}{:>8}", "turns yielding a fact", v.turns_informative);
     println!("{:<30}{:>8}", "sessions", v.sessions);
     println!("{:<30}{:>8}", "facts discarded (control)", v.discarded);
-    println!("{:<30}{:>8}", "facts unusable (truncated)", v.unusable);
+    println!(
+        "{:<30}{:>8}",
+        "facts unusable, control arm", v.unusable_control
+    );
+    println!(
+        "{:<30}{:>8}",
+        "facts unusable, treatment arm", v.unusable_treatment
+    );
     println!("{:<30}{:>8}", "facts informative", v.informative);
     if v.measured_tokens > 0 {
         println!(
@@ -522,7 +529,12 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
     );
     println!("response, and facts sharing an origin share their 'went to fetch it'");
     println!("verdict, so an interval bootstraps over sessions and not over facts.");
-    0
+    // A run that stopped early still reports what it bought, but it did not succeed.
+    if v.errors.is_empty() {
+        0
+    } else {
+        3
+    }
 }
 
 /// A CLI piped into `head` or `less` must exit quietly, not panic on a closed pipe.

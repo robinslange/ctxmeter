@@ -19,7 +19,11 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::Command;
 
-const MASK: &str = "[tool output removed by the context policy under test]";
+/// What a real context manager leaves behind. It deliberately does not say that a
+/// measurement is running: telling the model it is in an experiment is a reason for it to
+/// go looking for what vanished, and "went to fetch it" is one of the outcomes being
+/// counted.
+const MASK: &str = "[tool output cleared to reclaim context]";
 
 /// Published input/output prices per million tokens, checked 2026-09-14.
 /// Verify against the current pricing page before trusting an estimate.
@@ -640,6 +644,9 @@ fn post(api_key: &str, url: &str, body: &serde_json::Value) -> Result<serde_json
                 rps,
                 "-w",
                 "%{http_code}",
+                // A stalled connection must end the call rather than the run.
+                "--max-time",
+                "600",
             ])
             .output()
             .map_err(|e| format!("curl did not run: {e}"))?;
@@ -803,7 +810,10 @@ pub struct Verdict {
     pub sessions: usize,
     pub informative: usize,
     pub discarded: usize,
-    pub unusable: usize,
+    /// Truncated or refused, split by arm: the control costs one paid call, the treatment
+    /// two, and pooling them hides which arm is failing.
+    pub unusable_control: usize,
+    pub unusable_treatment: usize,
     pub reproduced: usize,
     pub regenerated: usize,
     pub sought: usize,
@@ -838,7 +848,8 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
         sessions: 0,
         informative: 0,
         discarded: 0,
-        unusable: 0,
+        unusable_control: 0,
+        unusable_treatment: 0,
         reproduced: 0,
         regenerated: 0,
         sought: 0,
@@ -921,7 +932,7 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
                 // A probe token can carry a credential or a client path, so it is
                 // named only under --show-raw, which the line above already did.
                 println!("turn {i} control arm unusable for one fact: {why}");
-                v.unusable += 1;
+                v.unusable_control += 1;
                 continue;
             }
             if !is_live_control(g) {
@@ -939,6 +950,9 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
         let treat = match call(api_key, &c.model, &c.messages_masked, &c.tools) {
             Ok(r) => r,
             Err(e) => {
+                // Counted when its control arm landed, but this turn produced no
+                // verdict, so it is not one of the turns the table reports.
+                v.turns_attempted -= 1;
                 v.errors.push(format!("turn {i} treatment: {e}"));
                 return v;
             }
@@ -954,7 +968,7 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
             }
             if let Some(why) = unusable(&treat, g) {
                 println!("turn {i} treatment arm unusable for one fact: {why}");
-                v.unusable += 1;
+                v.unusable_treatment += 1;
                 continue;
             }
             v.informative += 1;
