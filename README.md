@@ -2,7 +2,19 @@
 
 Measures what Claude Code actually bills you, from your own transcripts in `~/.claude/projects`.
 
-No API calls, no proxy, no config. Reads the `usage` records the CLI already writes.
+No API calls, no proxy, no config, and nothing leaves your machine. Reads the `usage`
+records the CLI already writes.
+
+```bash
+cargo build --release
+./target/release/ctxmeter summary      # cache hit rate, token classes, billed equivalents
+./target/release/ctxmeter floor        # system prompt + tool definitions, by month
+./target/release/ctxmeter probes       # how much later-needed information each policy destroys
+./target/release/ctxmeter sensitivity  # does the policy ranking survive widening the sample
+```
+
+`ctxmeter.py` is kept as a reference implementation. The Rust binary is what you
+distribute; the Python is what you check it against.
 
 ```bash
 python3 ctxmeter.py summary        # cache hit rate, token classes, billed equivalents
@@ -98,3 +110,31 @@ Each of these produced a wrong answer before it was caught.
 - Invalidation is all-or-nothing: 98.7% of turn pairs are clean incremental hits, and the
   rest lose a median 148,152 tokens, roughly a whole prefix. That is what breakpoint-anchored
   matching with a 20-block lookback predicts, and it means mid-history edits rarely pay.
+
+
+## Parity
+
+The Rust binary and the Python reference are checked against each other on the
+same corpus. `summary` agrees exactly. `probes` agrees within one point on every
+policy and gives the identical ranking; the small gap is deliberate, because the
+Rust build tests exact identifier membership per block where the Python tests
+substring containment.
+
+| policy | Rust | Python |
+|---|---|---|
+| keep last 3 | 27.6% | 28.1% |
+| keep last 10 | 56.2% | 57.4% |
+| keep last 25 | 79.2% | 80.2% |
+| tail budget 40k | 87.1% | 87.4% |
+| tail budget 100k | 97.9% | 97.8% |
+
+Full corpus, 2,485 sessions: 3.9s in Rust against 15.9s in Python. The reason to
+ship the Rust build is not speed, it is that replicating a finding should cost a
+stranger one command and no language runtime.
+
+## Privacy
+
+Probe tokens are literal strings lifted from tool output, so they can contain
+credentials, absolute paths, and client data. They are interned in memory and
+never printed. Every command emits aggregate numbers only. Nothing is written
+anywhere except stdout.
