@@ -1,3 +1,4 @@
+mod counterfactual;
 mod probes;
 mod transcript;
 
@@ -43,6 +44,26 @@ enum Cmd {
     /// Does the conclusion survive its own assumptions? Cache model, estimator
     /// scale, and uncertainty clustered by session.
     Robustness {
+        #[arg(long, default_value_t = 3)]
+        max_df: usize,
+        #[arg(long, default_value_t = 5)]
+        min_gap: usize,
+    },
+    /// Tier two. Replay the turn the agent actually took, with the context
+    /// intact and with the policy applied, and see whether the fact comes back.
+    /// Costs real money: dry-run first.
+    Counterfactual {
+        /// Tool results the policy keeps. 3 is a shipped default worth testing.
+        #[arg(long, default_value_t = 3)]
+        keep_last: usize,
+        #[arg(long, default_value_t = 40)]
+        sample: usize,
+        /// Build every request and price it, without calling the API.
+        #[arg(long)]
+        dry_run: bool,
+        /// Required to spend money.
+        #[arg(long)]
+        yes: bool,
         #[arg(long, default_value_t = 3)]
         max_df: usize,
         #[arg(long, default_value_t = 5)]
@@ -261,6 +282,99 @@ fn cmd_sensitivity(all: &[Session]) -> i32 {
     0
 }
 
+fn cmd_counterfactual(
+    all: &[Session],
+    names: &[String],
+    keep_last: usize,
+    sample: usize,
+    dry_run: bool,
+    yes: bool,
+    max_df: usize,
+    min_gap: usize,
+) -> i32 {
+    let sessions = eligible(all);
+    let probes = harvest(&sessions, max_df, min_gap);
+    let paths: Vec<String> = sessions.iter().map(|s| s.path.clone()).collect();
+    let pol = probes::Policy::KeepLast(keep_last);
+
+    let mut dropped = counterfactual::Dropped::default();
+    let cases =
+        counterfactual::build_cases(&sessions, &probes, &paths, names, pol, sample, &mut dropped);
+    if cases.is_empty() {
+        println!("No usable cases. The policy did not remove any harvested fact,");
+        println!("or no session could be rebuilt into a valid request.");
+        return 1;
+    }
+
+    let cost = counterfactual::estimate_cost(&cases);
+    let toks: u64 = cases
+        .iter()
+        .map(|c| {
+            let (a, b) = counterfactual::estimate_tokens(c);
+            a + b
+        })
+        .sum();
+    println!("policy under test: {}", pol.label());
+    println!("probes considered: {}", dropped.considered);
+    println!("  unrebuildable  : {}", dropped.unrebuildable);
+    println!("  policy kept it : {}", dropped.policy_kept_the_fact);
+    println!("cases built      : {}", cases.len());
+    println!("input tokens     : {toks} across both arms");
+    println!("estimated spend  : ${cost:.2}  (published prices, checked 2026-09-14)");
+    println!("\neach case is two calls: the intact context as control, then the");
+    println!("policy applied. a case only counts if the control reproduces the fact.");
+
+    if dry_run {
+        let mut models: Vec<(String, usize)> = Vec::new();
+        for c in &cases {
+            match models.iter_mut().find(|(m, _)| *m == c.model) {
+                Some(e) => e.1 += 1,
+                None => models.push((c.model.clone(), 1)),
+            }
+        }
+        println!("\nmodels to be called (the one that produced each trace):");
+        for (m, n) in models {
+            println!("  {m}  {n}");
+        }
+        let (a, b) = counterfactual::estimate_tokens(&cases[0]);
+        println!("\nfirst case: {} messages intact ({a} tok), masked ({b} tok)", cases[0].messages_intact.len());
+        println!("fact length {} chars, origin tool {:?}", cases[0].fact.len(), cases[0].origin_tool);
+        println!("\ndry run: nothing was sent.");
+        return 0;
+    }
+
+    let key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    if key.is_empty() {
+        eprintln!("\nANTHROPIC_API_KEY is not set.");
+        eprintln!("This needs a real API key. A Claude subscription credential will not do:");
+        eprintln!("Anthropic's terms do not permit using Free, Pro or Max OAuth tokens in");
+        eprintln!("another tool, so ctxmeter will not read them.");
+        return 2;
+    }
+    if !yes {
+        eprintln!("\nRefusing to spend ${cost:.2} without --yes.");
+        return 2;
+    }
+
+    let v = counterfactual::run(&cases, &key);
+    println!("\n{:<26}{:>8}", "cases attempted", cases.len());
+    println!("{:<26}{:>8}", "discarded (control failed)", v.discarded);
+    println!("{:<26}{:>8}", "informative", v.informative);
+    if v.informative == 0 {
+        println!("\nNo informative cases. Nothing can be concluded.");
+        return 1;
+    }
+    let p = |n: usize| format!("{:.1}%", n as f64 / v.informative as f64 * 100.0);
+    println!("\nof the informative cases, with the fact removed the model:");
+    println!("  {:<24}{:>8}{:>9}", "reproduced it anyway", v.reproduced, p(v.reproduced));
+    println!("  {:<24}{:>8}{:>9}", "went to fetch it", v.sought, p(v.sought));
+    println!("  {:<24}{:>8}{:>9}", "did neither", v.silent, p(v.silent));
+    println!("\n'did neither' is the irreversible share: the fact was gone and the model");
+    println!("did not ask for it back. 'went to fetch it' is the healthy failure.");
+    println!("this still measures the next action, not task success.");
+    0
+}
+
 /// A CLI piped into `head` or `less` must exit quietly, not panic on a closed pipe.
 #[cfg(unix)]
 fn allow_sigpipe() {
@@ -406,6 +520,16 @@ fn main() {
         Cmd::Sensitivity => cmd_sensitivity(&sessions),
         Cmd::Tradeoff { max_df, min_gap } => cmd_tradeoff(&sessions, max_df, min_gap),
         Cmd::Robustness { max_df, min_gap } => cmd_robustness(&sessions, max_df, min_gap),
+        Cmd::Counterfactual {
+            keep_last,
+            sample,
+            dry_run,
+            yes,
+            max_df,
+            min_gap,
+        } => cmd_counterfactual(
+            &sessions, &it.names, keep_last, sample, dry_run, yes, max_df, min_gap,
+        ),
     };
     std::process::exit(code);
 }

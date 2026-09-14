@@ -24,6 +24,9 @@ pub enum Role {
 }
 
 pub struct Block {
+    /// Index of the message this block belongs to. Tier two cuts at message
+    /// boundaries, because a request ends before the assistant turn it asks for.
+    pub msg: u32,
     pub kind: Kind,
     pub role: Role,
     pub tokens: u32,
@@ -41,6 +44,8 @@ pub struct Usage {
 }
 
 pub struct Session {
+    /// Transcript file this came from. Tier two re-reads it to rebuild requests.
+    pub path: String,
     /// Content messages seen, used to exclude sessions too short to yield probes.
     pub msgs: usize,
     pub blocks: Vec<Block>,
@@ -135,6 +140,7 @@ pub fn read_session(
     let mut turns: Vec<(usize, u64)> = Vec::new();
     let mut fresh_usage: Option<u64> = None;
     let mut msgs_seen = 0usize;
+    let mut msg_idx: u32 = 0;
     let mut tool_media: HashMap<String, bool> = HashMap::new();
     let mut buf = Vec::new();
 
@@ -193,7 +199,10 @@ pub fn read_session(
                 owned = vec![serde_json::json!({"type": "text", "text": s})];
                 &owned
             }
-            _ => continue,
+            _ => {
+                msg_idx += 1;
+                continue;
+            }
         };
 
         if role == Role::Assistant {
@@ -265,12 +274,14 @@ pub fn read_session(
             toks.dedup();
 
             blocks.push(Block {
+                msg: msg_idx,
                 kind,
                 role,
                 tokens: est_tokens(body.len(), media || media_read),
                 toks,
             });
         }
+        msg_idx += 1;
     }
 
     if msgs_seen < 6 && usage.is_empty() {
@@ -278,6 +289,7 @@ pub fn read_session(
     }
     usage.sort_by(|a, b| a.ts.cmp(&b.ts));
     Some(Session {
+        path: path.display().to_string(),
         msgs: msgs_seen,
         blocks,
         turns,

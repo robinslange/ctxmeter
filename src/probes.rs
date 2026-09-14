@@ -23,6 +23,28 @@ impl Policy {
         }
     }
 
+    /// Same decision, but against sizes supplied directly rather than looked up
+    /// in a session. Tier two rebuilds requests from raw JSON and has no blocks.
+    pub fn survives_from_indexed(
+        &self,
+        live: &[usize],
+        sizes: &std::collections::HashMap<usize, u32>,
+    ) -> usize {
+        match *self {
+            Policy::KeepLast(n) => live.len().saturating_sub(n),
+            Policy::TailBudget(budget) => {
+                let mut run: u64 = 0;
+                for (p, i) in live.iter().enumerate().rev() {
+                    run += *sizes.get(i).unwrap_or(&0) as u64;
+                    if run > budget as u64 {
+                        return p + 1;
+                    }
+                }
+                0
+            }
+        }
+    }
+
     /// Lowest position in `live` that survives this policy.
     fn survives_from(&self, live: &[usize], blocks: &[Block]) -> usize {
         match *self {
