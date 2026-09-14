@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, linker: aarch64-linux-gnu-gcc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross linker
+        if: matrix.linker != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p ~/.cargo
+          {
+            echo "[target.${{ matrix.target }}]"
+            echo "linker = \"${{ matrix.linker }}\""
+          } >> ~/.cargo/config.toml
+
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          name="ctxmeter-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/${{ matrix.target }}/release/ctxmeter "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          tar -C dist -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ctxmeter-${{ matrix.target }}
+          path: |
+            ctxmeter-${{ matrix.target }}.tar.gz
+            ctxmeter-${{ matrix.target }}.tar.gz.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
+          body: |
+            Measure what your coding agent bills you, and what context compaction
+            destroys, from transcripts you already have.
+
+            Nothing leaves your machine. `summary`, `floor`, `probes`,
+            `sensitivity`, `tradeoff` and `robustness` make no network calls.
+            `counterfactual` does, and needs a real API key plus `--yes`.
+
+            Download the archive for your platform, verify the checksum, and run
+            `ctxmeter summary`.

@@ -227,7 +227,10 @@ pub fn billed_cost(sessions: &[&Session], pol: Option<Policy>) -> f64 {
     billed_cost_with(
         sessions,
         pol,
-        &CostOpts { model: CacheModel::LongestPrefix, scale: 1.0 },
+        &CostOpts {
+            model: CacheModel::LongestPrefix,
+            scale: 1.0,
+        },
     )
 }
 
@@ -283,8 +286,13 @@ pub fn billed_cost_with(sessions: &[&Session], pol: Option<Policy>, o: &CostOpts
                 // the appended tail is new either way; what differs is whether an
                 // edit inside the region forfeits the blocks before it
                 CacheModel::AllOrNothing => {
-                    let unchanged_prefix = identical || lcp >= prev.iter().map(|x| x.1).sum::<u64>();
-                    if unchanged_prefix { lcp } else { 0 }
+                    let unchanged_prefix =
+                        identical || lcp >= prev.iter().map(|x| x.1).sum::<u64>();
+                    if unchanged_prefix {
+                        lcp
+                    } else {
+                        0
+                    }
                 }
             };
             if !prev.is_empty() {

@@ -84,7 +84,10 @@ fn whitelist(block: &serde_json::Value) -> Option<serde_json::Value> {
         }
         "tool_result" => {
             out.insert("tool_use_id".into(), block.get("tool_use_id")?.clone());
-            let c = block.get("content").cloned().unwrap_or(serde_json::json!(""));
+            let c = block
+                .get("content")
+                .cloned()
+                .unwrap_or(serde_json::json!(""));
             out.insert("content".into(), c);
         }
         // Thinking blocks carry signatures that will not validate in a fresh
@@ -94,9 +97,17 @@ fn whitelist(block: &serde_json::Value) -> Option<serde_json::Value> {
     Some(serde_json::Value::Object(out))
 }
 
+/// Messages, synthesised tool definitions, and a map from tool_use id to the
+/// call that produced it: (tool name, the path or command it targeted).
+type Rebuilt = (
+    Vec<serde_json::Value>,
+    Vec<serde_json::Value>,
+    HashMap<String, (String, String)>,
+);
+
 /// Rebuild a valid Messages request from the transcript, cutting before the
 /// assistant turn we want the model to produce.
-fn rebuild(path: &Path, upto_msg: u32) -> Option<(Vec<serde_json::Value>, Vec<serde_json::Value>, HashMap<String, (String, String)>)> {
+fn rebuild(path: &Path, upto_msg: u32) -> Option<Rebuilt> {
     let f = File::open(path).ok()?;
     let mut seen: HashSet<String> = HashSet::new();
     let mut msgs: Vec<serde_json::Value> = Vec::new();
@@ -325,8 +336,14 @@ pub fn build_cases(
 }
 
 pub fn estimate_tokens(c: &Case) -> (u64, u64) {
-    let a = serde_json::to_string(&c.messages_intact).unwrap_or_default().len() as u64 / 4;
-    let b = serde_json::to_string(&c.messages_masked).unwrap_or_default().len() as u64 / 4;
+    let a = serde_json::to_string(&c.messages_intact)
+        .unwrap_or_default()
+        .len() as u64
+        / 4;
+    let b = serde_json::to_string(&c.messages_masked)
+        .unwrap_or_default()
+        .len() as u64
+        / 4;
     let t = serde_json::to_string(&c.tools).unwrap_or_default().len() as u64 / 4;
     (a + t, b + t)
 }
@@ -344,7 +361,12 @@ pub fn estimate_cost(cases: &[Case]) -> f64 {
 
 /// POST one request through curl, keeping the key out of the process list by
 /// passing headers in a 0600 config file rather than on the command line.
-fn call(api_key: &str, model: &str, msgs: &[serde_json::Value], tools: &[serde_json::Value]) -> Option<serde_json::Value> {
+fn call(
+    api_key: &str,
+    model: &str,
+    msgs: &[serde_json::Value],
+    tools: &[serde_json::Value],
+) -> Option<serde_json::Value> {
     let body = serde_json::json!({
         "model": model,
         "max_tokens": 1024,

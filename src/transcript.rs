@@ -78,7 +78,12 @@ fn ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b':' | b'-')
 }
 
-/// Non-guessable identifiers: >=10 chars, contains a digit, not a bare number.
+/// Non-guessable identifiers: at least 10 characters, at least one digit, and at
+/// least three letters.
+///
+/// The letter floor is what excludes timestamps. `2026-09-01T10:00:00Z` carries a
+/// digit and two letters, so a weaker rule admits it, and a timestamp is a poor
+/// probe: it recurs in every log line and is half-derivable from context.
 pub fn candidates(text: &str, mut push: impl FnMut(&str)) {
     let b = text.as_bytes();
     let mut i = 0;
@@ -96,15 +101,15 @@ pub fn candidates(text: &str, mut push: impl FnMut(&str)) {
             continue;
         }
         let mut has_digit = false;
-        let mut has_alpha = false;
+        let mut alphas = 0usize;
         for &c in run {
             if c.is_ascii_digit() {
                 has_digit = true;
             } else if c.is_ascii_alphabetic() {
-                has_alpha = true;
+                alphas += 1;
             }
         }
-        if has_digit && has_alpha {
+        if has_digit && alphas >= 3 {
             if let Ok(s) = std::str::from_utf8(run) {
                 push(s);
             }
@@ -119,6 +124,42 @@ fn est_tokens(n: usize, media: bool) -> u32 {
     } else {
         t as u32
     }
+}
+
+/// Kind and billed size of one content block, plus the text worth scanning for
+/// identifiers. One decision in one place, so it can be tested directly.
+///
+/// `media_hint` covers what a block cannot see about itself: a tool_result whose
+/// originating call read an image or a PDF.
+pub fn classify(b: &serde_json::Value, media_hint: bool) -> (Kind, u32, String) {
+    let (kind, body, media) = match b.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        "tool_result" => {
+            let raw = b.get("content").map(text_of).unwrap_or_default();
+            let media = raw.contains("\"base64\"") || raw.contains("\"image\"");
+            (Kind::ToolResult, raw, media)
+        }
+        "text" => (
+            Kind::Text,
+            b.get("text").map(text_of).unwrap_or_default(),
+            false,
+        ),
+        // A thinking block carries a long opaque signature. That is metadata,
+        // not billed prose: counting it produced a spurious 24.7% cost line.
+        "thinking" => (
+            Kind::Thinking,
+            b.get("thinking").map(text_of).unwrap_or_default(),
+            false,
+        ),
+        "tool_use" => (
+            Kind::ToolUse,
+            b.get("input").map(|v| v.to_string()).unwrap_or_default(),
+            false,
+        ),
+        "image" | "document" => (Kind::Media, b.to_string(), true),
+        other => (Kind::Other, other.to_string(), false),
+    };
+    let tokens = est_tokens(body.len(), media || media_hint);
+    (kind, tokens, body)
 }
 
 fn text_of(v: &serde_json::Value) -> String {
@@ -166,8 +207,16 @@ pub fn read_session(
                 );
                 let g = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
                 usage.push(Usage {
-                    ts: d.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    model: m.get("model").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                    ts: d
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    model: m
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
                     read: g("cache_read_input_tokens"),
                     write: g("cache_creation_input_tokens"),
                     fresh: g("input_tokens"),
@@ -215,52 +264,32 @@ pub fn read_session(
         fresh_usage = None;
 
         for b in items {
-            let kind_s = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            let (kind, body, media) = match kind_s {
-                "tool_result" => {
-                    let raw = b.get("content").map(text_of).unwrap_or_default();
-                    let media = raw.contains("\"base64\"") || raw.contains("\"image\"");
-                    (Kind::ToolResult, raw, media)
-                }
-                "text" => (Kind::Text, b.get("text").map(text_of).unwrap_or_default(), false),
-                "thinking" => (
-                    Kind::Thinking,
-                    b.get("thinking").map(text_of).unwrap_or_default(),
-                    false,
-                ),
-                "tool_use" => {
-                    if let (Some(id), Some(name)) = (
-                        b.get("id").and_then(|v| v.as_str()),
-                        b.get("name").and_then(|v| v.as_str()),
-                    ) {
-                        let fp = b
-                            .get("input")
-                            .and_then(|i| i.get("file_path"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_ascii_lowercase();
-                        let is_media = name == "Read"
-                            && [".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf"]
-                                .iter()
-                                .any(|e| fp.ends_with(e));
-                        tool_media.insert(id.to_string(), is_media);
-                    }
-                    (
-                        Kind::ToolUse,
-                        b.get("input").map(|v| v.to_string()).unwrap_or_default(),
-                        false,
-                    )
-                }
-                "image" | "document" => (Kind::Media, b.to_string(), true),
-                _ => (Kind::Other, b.to_string(), false),
-            };
-
-            let media_read = kind == Kind::ToolResult
-                && b.get("tool_use_id")
+            // A Read of an image or PDF returns an image-shaped result, so record
+            // that here for the result block that arrives later.
+            if let (Some(id), Some(name)) = (
+                b.get("id").and_then(|v| v.as_str()),
+                b.get("name").and_then(|v| v.as_str()),
+            ) {
+                let fp = b
+                    .get("input")
+                    .and_then(|i| i.get("file_path"))
                     .and_then(|v| v.as_str())
-                    .and_then(|id| tool_media.get(id))
-                    .copied()
-                    .unwrap_or(false);
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let is_media = name == "Read"
+                    && [".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf"]
+                        .iter()
+                        .any(|e| fp.ends_with(e));
+                tool_media.insert(id.to_string(), is_media);
+            }
+            let media_hint = b
+                .get("tool_use_id")
+                .and_then(|v| v.as_str())
+                .and_then(|id| tool_media.get(id))
+                .copied()
+                .unwrap_or(false);
+
+            let (kind, tokens, body) = classify(b, media_hint);
 
             let want_toks = matches!(kind, Kind::ToolResult)
                 || (role == Role::Assistant && matches!(kind, Kind::Text | Kind::ToolUse))
@@ -277,7 +306,7 @@ pub fn read_session(
                 msg: msg_idx,
                 kind,
                 role,
-                tokens: est_tokens(body.len(), media || media_read),
+                tokens,
                 toks,
             });
         }
@@ -300,7 +329,10 @@ pub fn read_session(
 pub fn load(root: &Path, it: &mut Interner) -> Vec<Session> {
     let mut out = Vec::new();
     let mut seen_req = std::collections::HashSet::new();
-    for e in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+    for e in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
         if e.file_type().is_file() && e.path().extension().map(|x| x == "jsonl").unwrap_or(false) {
             if let Some(s) = read_session(e.path(), it, &mut seen_req) {
                 out.push(s);
@@ -308,4 +340,66 @@ pub fn load(root: &Path, it: &mut Interner) -> Vec<Session> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cands(s: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        candidates(s, |t| out.push(t.to_string()));
+        out
+    }
+
+    #[test]
+    fn accepts_identifiers_that_cannot_be_guessed() {
+        assert_eq!(cands("build a7f3c9e21b84 failed"), ["a7f3c9e21b84"]);
+        assert_eq!(
+            cands("see /srv/app/migrations/0042_add_column.sql"),
+            ["/srv/app/migrations/0042_add_column.sql"]
+        );
+    }
+
+    #[test]
+    fn rejects_what_a_model_could_produce_without_memory() {
+        // too short to be unguessable
+        assert!(cands("id ab12cd").is_empty());
+        // no digit: ordinary prose, not an identifier
+        assert!(cands("migrationfailure").is_empty());
+        // bare numbers and version-like runs carry no alphabetic entropy
+        assert!(cands("1234567890123").is_empty());
+        assert!(cands("2026-09-01T10:00:00").is_empty());
+    }
+
+    #[test]
+    fn thinking_signatures_are_not_counted_as_cost() {
+        let b = serde_json::json!({
+            "type": "thinking",
+            "thinking": "four",
+            "signature": "x".repeat(4000),
+        });
+        let (kind, tokens, _) = classify(&b, false);
+        assert_eq!(kind, Kind::Thinking);
+        // Only the thinking text counts. Counting the signature produced a
+        // spurious 24.7% cost line.
+        assert_eq!(tokens, 1);
+    }
+
+    #[test]
+    fn image_payloads_are_scaled_not_taken_literally() {
+        let raw = format!("{{\"base64\":\"{}\"}}", "A".repeat(4000));
+        let b = serde_json::json!({"type": "tool_result", "content": raw});
+        let (_, tokens, _) = classify(&b, false);
+        // The API prices images by pixel area, so base64 length overstates them.
+        assert!(u64::from(tokens) < (raw.len() / 4) as u64);
+    }
+
+    #[test]
+    fn a_read_of_a_pdf_scales_its_result_even_without_base64() {
+        let b = serde_json::json!({"type": "tool_result", "content": "x".repeat(4000)});
+        let (_, plain, _) = classify(&b, false);
+        let (_, hinted, _) = classify(&b, true);
+        assert!(hinted < plain);
+    }
 }

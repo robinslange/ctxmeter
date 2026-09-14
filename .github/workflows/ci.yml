@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all
+
+  smoke:
+    # Compiling proves nothing about the reader. Run the binary against a
+    # synthetic transcript and check it produces the numbers we expect.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: summary reads the fixture
+        run: |
+          out=$(./target/release/ctxmeter summary --root tests/fixture)
+          echo "$out"
+          echo "$out" | grep -q "turns 4" || { echo "expected 4 turns"; exit 1; }
+          echo "$out" | grep -q "cache hit rate" || exit 1
+      - name: probes exits non-zero on an empty harvest
+        run: |
+          # A denominator that stops growing must not read as a pass.
+          set +e
+          ./target/release/ctxmeter probes --root tests/fixture --max-df 0
+          code=$?
+          set -e
+          test "$code" -eq 1 || { echo "expected exit 1 on empty harvest, got $code"; exit 1; }
+      - name: counterfactual never sends anything on a dry run
+        run: |
+          ANTHROPIC_API_KEY= ./target/release/ctxmeter counterfactual \
+            --root tests/fixture --dry-run --sample 2 || true

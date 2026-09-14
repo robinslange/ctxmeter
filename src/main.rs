@@ -80,6 +80,7 @@ enum Cmd {
 
 fn default_root() -> PathBuf {
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_default()
         .join(".claude/projects")
@@ -113,7 +114,10 @@ fn cmd_summary(sessions: &[Session]) {
     let tot = (read + write + fresh) as f64;
     let cost = fresh as f64 + 1.25 * write as f64 + 0.10 * read as f64;
     println!("turns {turns}   sessions {n_sessions}");
-    println!("\n{:<10}{:>18}{:>10}{:>18}", "", "tokens", "share", "billed equiv");
+    println!(
+        "\n{:<10}{:>18}{:>10}{:>18}",
+        "", "tokens", "share", "billed equiv"
+    );
     for (name, v, mult) in [
         ("fresh", fresh, 1.0),
         ("write", write, 1.25),
@@ -132,7 +136,11 @@ fn cmd_summary(sessions: &[Session]) {
     println!("billed equivalents  {cost:.0}  (no-cache counterfactual {tot:.0})");
     println!("caching already saves {}", pct(1.0 - cost / tot));
     models.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-    let list: Vec<String> = models.iter().take(4).map(|(m, n)| format!("{m} {n}")).collect();
+    let list: Vec<String> = models
+        .iter()
+        .take(4)
+        .map(|(m, n)| format!("{m} {n}"))
+        .collect();
     println!("\nmodels: {}", list.join(", "));
 }
 
@@ -160,7 +168,10 @@ fn cmd_floor(sessions: &[Session]) {
         println!("  p{q}: {:>10}", all[all.len() * q / 100]);
     }
     by.sort_by(|a, b| a.0.cmp(&b.0));
-    println!("\n{:<10}{:>10}{:>12}{:>12}", "month", "sessions", "median", "p90");
+    println!(
+        "\n{:<10}{:>10}{:>12}{:>12}",
+        "month", "sessions", "median", "p90"
+    );
     for (mo, mut v) in by {
         if v.len() < 15 {
             continue;
@@ -212,7 +223,10 @@ fn cmd_probes(all: &[Session], max_df: usize, min_gap: usize) -> i32 {
         gaps[gaps.len() * 9 / 10],
         gaps[gaps.len() - 1]
     );
-    println!("{:<20}{:>10}{:>12}{:>11}", "policy", "probes", "destroyed", "retained");
+    println!(
+        "{:<20}{:>10}{:>12}{:>11}",
+        "policy", "probes", "destroyed", "retained"
+    );
     for pol in default_policies() {
         let (kept, total) = retention(&sessions, &probes, pol);
         if total == 0 {
@@ -252,7 +266,11 @@ fn cmd_sensitivity(all: &[Session]) -> i32 {
             let mut scored: Vec<(String, f64)> = Vec::new();
             for pol in &pols {
                 let (kept, total) = retention(&sessions, &probes, *pol);
-                let r = if total == 0 { 0.0 } else { kept as f64 / total as f64 };
+                let r = if total == 0 {
+                    0.0
+                } else {
+                    kept as f64 / total as f64
+                };
                 print!("{:>17.1}%", r * 100.0);
                 scored.push((pol.label(), r));
             }
@@ -282,24 +300,31 @@ fn cmd_sensitivity(all: &[Session]) -> i32 {
     0
 }
 
-fn cmd_counterfactual(
-    all: &[Session],
-    names: &[String],
+struct CfArgs {
     keep_last: usize,
     sample: usize,
     dry_run: bool,
     yes: bool,
     max_df: usize,
     min_gap: usize,
-) -> i32 {
+}
+
+fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
     let sessions = eligible(all);
-    let probes = harvest(&sessions, max_df, min_gap);
+    let probes = harvest(&sessions, a.max_df, a.min_gap);
     let paths: Vec<String> = sessions.iter().map(|s| s.path.clone()).collect();
-    let pol = probes::Policy::KeepLast(keep_last);
+    let pol = probes::Policy::KeepLast(a.keep_last);
 
     let mut dropped = counterfactual::Dropped::default();
-    let cases =
-        counterfactual::build_cases(&sessions, &probes, &paths, names, pol, sample, &mut dropped);
+    let cases = counterfactual::build_cases(
+        &sessions,
+        &probes,
+        &paths,
+        names,
+        pol,
+        a.sample,
+        &mut dropped,
+    );
     if cases.is_empty() {
         println!("No usable cases. The policy did not remove any harvested fact,");
         println!("or no session could be rebuilt into a valid request.");
@@ -324,7 +349,7 @@ fn cmd_counterfactual(
     println!("\neach case is two calls: the intact context as control, then the");
     println!("policy applied. a case only counts if the control reproduces the fact.");
 
-    if dry_run {
+    if a.dry_run {
         let mut models: Vec<(String, usize)> = Vec::new();
         for c in &cases {
             match models.iter_mut().find(|(m, _)| *m == c.model) {
@@ -337,8 +362,15 @@ fn cmd_counterfactual(
             println!("  {m}  {n}");
         }
         let (a, b) = counterfactual::estimate_tokens(&cases[0]);
-        println!("\nfirst case: {} messages intact ({a} tok), masked ({b} tok)", cases[0].messages_intact.len());
-        println!("fact length {} chars, origin tool {:?}", cases[0].fact.len(), cases[0].origin_tool);
+        println!(
+            "\nfirst case: {} messages intact ({a} tok), masked ({b} tok)",
+            cases[0].messages_intact.len()
+        );
+        println!(
+            "fact length {} chars, origin tool {:?}",
+            cases[0].fact.len(),
+            cases[0].origin_tool
+        );
         println!("\ndry run: nothing was sent.");
         return 0;
     }
@@ -351,7 +383,7 @@ fn cmd_counterfactual(
         eprintln!("another tool, so ctxmeter will not read them.");
         return 2;
     }
-    if !yes {
+    if !a.yes {
         eprintln!("\nRefusing to spend ${cost:.2} without --yes.");
         return 2;
     }
@@ -366,8 +398,18 @@ fn cmd_counterfactual(
     }
     let p = |n: usize| format!("{:.1}%", n as f64 / v.informative as f64 * 100.0);
     println!("\nof the informative cases, with the fact removed the model:");
-    println!("  {:<24}{:>8}{:>9}", "reproduced it anyway", v.reproduced, p(v.reproduced));
-    println!("  {:<24}{:>8}{:>9}", "went to fetch it", v.sought, p(v.sought));
+    println!(
+        "  {:<24}{:>8}{:>9}",
+        "reproduced it anyway",
+        v.reproduced,
+        p(v.reproduced)
+    );
+    println!(
+        "  {:<24}{:>8}{:>9}",
+        "went to fetch it",
+        v.sought,
+        p(v.sought)
+    );
     println!("  {:<24}{:>8}{:>9}", "did neither", v.silent, p(v.silent));
     println!("\n'did neither' is the irreversible share: the fact was gone and the model");
     println!("did not ask for it back. 'went to fetch it' is the healthy failure.");
@@ -436,14 +478,20 @@ fn cmd_robustness(all: &[Session], max_df: usize, min_gap: usize) -> i32 {
     println!("1. COST MODEL. The cost column is a simulation. Does its sign survive");
     println!("   replacing generous prefix matching with the all-or-nothing behaviour");
     println!("   measured on real traces?\n");
-    println!("{:<20}{:>16}{:>16}", "policy", "longest-prefix", "all-or-nothing");
+    println!(
+        "{:<20}{:>16}{:>16}",
+        "policy", "longest-prefix", "all-or-nothing"
+    );
     for &m in &[CacheModel::LongestPrefix, CacheModel::AllOrNothing] {
         let _ = m;
     }
     for pol in &pols {
         let mut cells = Vec::new();
         for &m in &[CacheModel::LongestPrefix, CacheModel::AllOrNothing] {
-            let o = CostOpts { model: m, scale: 1.0 };
+            let o = CostOpts {
+                model: m,
+                scale: 1.0,
+            };
             let base = billed_cost_with(&sessions, None, &o);
             let c = billed_cost_with(&sessions, Some(*pol), &o);
             cells.push((1.0 - c / base) * 100.0);
@@ -457,7 +505,10 @@ fn cmd_robustness(all: &[Session], max_df: usize, min_gap: usize) -> i32 {
     for pol in &pols {
         let mut cells = Vec::new();
         for sc in [1.0, 2.0, 3.0] {
-            let o = CostOpts { model: CacheModel::LongestPrefix, scale: sc };
+            let o = CostOpts {
+                model: CacheModel::LongestPrefix,
+                scale: sc,
+            };
             let base = billed_cost_with(&sessions, None, &o);
             let c = billed_cost_with(&sessions, Some(*pol), &o);
             cells.push((1.0 - c / base) * 100.0);
@@ -474,7 +525,10 @@ fn cmd_robustness(all: &[Session], max_df: usize, min_gap: usize) -> i32 {
     println!("\n3. UNCERTAINTY. Probes inside one session share a trajectory, so they");
     println!("   are not independent. 95% interval from a cluster bootstrap over");
     println!("   sessions, 2000 resamples.\n");
-    println!("{:<20}{:>10}{:>22}{:>10}", "policy", "retained", "95% CI (clustered)", "sessions");
+    println!(
+        "{:<20}{:>10}{:>22}{:>10}",
+        "policy", "retained", "95% CI (clustered)", "sessions"
+    );
     for pol in &pols {
         let per = retention_by_session(&sessions, &probes, *pol);
         let (kept, total) = retention(&sessions, &probes, *pol);
@@ -528,7 +582,16 @@ fn main() {
             max_df,
             min_gap,
         } => cmd_counterfactual(
-            &sessions, &it.names, keep_last, sample, dry_run, yes, max_df, min_gap,
+            &sessions,
+            &it.names,
+            CfArgs {
+                keep_last,
+                sample,
+                dry_run,
+                yes,
+                max_df,
+                min_gap,
+            },
         ),
     };
     std::process::exit(code);
