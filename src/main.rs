@@ -212,9 +212,9 @@ fn cmd_floor(sessions: &[Session]) {
     println!("never appear in a transcript.");
 }
 
-fn cmd_probes(all: &[Session], max_df: usize, min_gap: usize) -> i32 {
+fn cmd_probes(all: &[Session], family: &[u32], max_df: usize, min_gap: usize) -> i32 {
     let sessions = eligible(all);
-    let probes = harvest(&sessions, max_df, min_gap);
+    let probes = harvest(&sessions, family, max_df, min_gap);
     let n: usize = probes.iter().map(|v| v.len()).sum();
     let yielding = probes.iter().filter(|v| !v.is_empty()).count();
     println!(
@@ -326,7 +326,7 @@ fn cmd_probes(all: &[Session], max_df: usize, min_gap: usize) -> i32 {
     0
 }
 
-fn cmd_sensitivity(all: &[Session]) -> i32 {
+fn cmd_sensitivity(all: &[Session], family: &[u32]) -> i32 {
     let sessions = eligible(all);
     let pols = default_policies();
     print!("{:>7}{:>6}{:>10}", "rarity", "gap", "probes");
@@ -337,7 +337,7 @@ fn cmd_sensitivity(all: &[Session]) -> i32 {
     let mut orders: Vec<Vec<String>> = Vec::new();
     for max_df in [1usize, 3, 10] {
         for min_gap in [5usize, 20] {
-            let probes = harvest(&sessions, max_df, min_gap);
+            let probes = harvest(&sessions, family, max_df, min_gap);
             let n: usize = probes.iter().map(|v| v.len()).sum();
             if n == 0 {
                 continue;
@@ -411,9 +411,9 @@ fn print_drops(d: &counterfactual::Dropped, skip: usize, built: usize) {
     println!("turns built       : {built}");
 }
 
-fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
+fn cmd_counterfactual(all: &[Session], names: &[String], family: &[u32], a: CfArgs) -> i32 {
     let sessions = eligible(all);
-    let probes = harvest(&sessions, a.max_df, a.min_gap);
+    let probes = harvest(&sessions, family, a.max_df, a.min_gap);
     let paths: Vec<String> = sessions.iter().map(|s| s.path.clone()).collect();
     let pol = probes::Policy::KeepLast(a.keep_last);
 
@@ -639,9 +639,9 @@ fn allow_sigpipe() {
 #[cfg(not(unix))]
 fn allow_sigpipe() {}
 
-fn cmd_tradeoff(all: &[Session], max_df: usize, min_gap: usize) -> i32 {
+fn cmd_tradeoff(all: &[Session], family: &[u32], max_df: usize, min_gap: usize) -> i32 {
     let sessions = eligible(all);
-    let probes = harvest(&sessions, max_df, min_gap);
+    let probes = harvest(&sessions, family, max_df, min_gap);
     let n: usize = probes.iter().map(|v| v.len()).sum();
     if n == 0 {
         println!("NO PROBES HARVESTED; cannot report a tradeoff.");
@@ -680,9 +680,9 @@ fn cmd_tradeoff(all: &[Session], max_df: usize, min_gap: usize) -> i32 {
     0
 }
 
-fn cmd_robustness(all: &[Session], max_df: usize, min_gap: usize) -> i32 {
+fn cmd_robustness(all: &[Session], family: &[u32], max_df: usize, min_gap: usize) -> i32 {
     let sessions = eligible(all);
-    let probes = harvest(&sessions, max_df, min_gap);
+    let probes = harvest(&sessions, family, max_df, min_gap);
     if probes.iter().all(|v| v.is_empty()) {
         println!("NO PROBES HARVESTED.");
         return 1;
@@ -784,10 +784,12 @@ fn main() {
             cmd_floor(&sessions);
             0
         }
-        Cmd::Probes { max_df, min_gap } => cmd_probes(&sessions, max_df, min_gap),
-        Cmd::Sensitivity => cmd_sensitivity(&sessions),
-        Cmd::Tradeoff { max_df, min_gap } => cmd_tradeoff(&sessions, max_df, min_gap),
-        Cmd::Robustness { max_df, min_gap } => cmd_robustness(&sessions, max_df, min_gap),
+        Cmd::Probes { max_df, min_gap } => cmd_probes(&sessions, &it.family, max_df, min_gap),
+        Cmd::Sensitivity => cmd_sensitivity(&sessions, &it.family),
+        Cmd::Tradeoff { max_df, min_gap } => cmd_tradeoff(&sessions, &it.family, max_df, min_gap),
+        Cmd::Robustness { max_df, min_gap } => {
+            cmd_robustness(&sessions, &it.family, max_df, min_gap)
+        }
         Cmd::Counterfactual {
             keep_last,
             model,
@@ -802,6 +804,7 @@ fn main() {
         } => cmd_counterfactual(
             &sessions,
             &it.names,
+            &it.family,
             CfArgs {
                 keep_last,
                 model,

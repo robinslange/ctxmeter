@@ -92,7 +92,15 @@ pub fn eligible(sessions: &[Session]) -> Vec<&Session> {
     sessions.iter().filter(|s| s.msgs >= MIN_MSGS).collect()
 }
 
-pub fn harvest(sessions: &[&Session], max_df: usize, min_gap: usize) -> Vec<Vec<Probe>> {
+/// Rarity is counted per family, not per literal: tokens that differ only in their
+/// digits are one family, and a numbered family is guessable from any one member
+/// even when each member sits in a single session.
+pub fn harvest(
+    sessions: &[&Session],
+    family: &[u32],
+    max_df: usize,
+    min_gap: usize,
+) -> Vec<Vec<Probe>> {
     let mut df: HashMap<u32, u32> = HashMap::new();
     for s in sessions {
         let mut here: Vec<u32> = Vec::new();
@@ -101,10 +109,11 @@ pub fn harvest(sessions: &[&Session], max_df: usize, min_gap: usize) -> Vec<Vec<
                 here.extend_from_slice(&b.toks);
             }
         }
+        let mut here: Vec<u32> = here.into_iter().map(|t| family[t as usize]).collect();
         here.sort_unstable();
         here.dedup();
-        for t in here {
-            *df.entry(t).or_insert(0) += 1;
+        for f in here {
+            *df.entry(f).or_insert(0) += 1;
         }
     }
 
@@ -118,7 +127,8 @@ pub fn harvest(sessions: &[&Session], max_df: usize, min_gap: usize) -> Vec<Vec<
                 match (b.role, b.kind) {
                     (_, Kind::ToolResult) => {
                         for &t in &b.toks {
-                            if df.get(&t).copied().unwrap_or(0) as usize <= max_df {
+                            if df.get(&family[t as usize]).copied().unwrap_or(0) as usize <= max_df
+                            {
                                 origin.entry(t).or_insert(i);
                             }
                         }
@@ -385,4 +395,63 @@ pub fn bootstrap_ci(per_session: &[(u64, u64)], iters: usize) -> (f64, f64) {
         return (f64::NAN, f64::NAN);
     }
     (rs[rs.len() * 25 / 1000], rs[rs.len() * 975 / 1000])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcript::{Interner, Kind, Role};
+
+    fn session(blocks: Vec<Block>) -> Session {
+        Session {
+            path: "s.jsonl".into(),
+            msgs: blocks.len() + 1,
+            blocks,
+            turns: vec![],
+            usage: vec![],
+        }
+    }
+
+    fn block(i: u32, role: Role, kind: Kind, toks: Vec<u32>) -> Block {
+        Block {
+            msg: i,
+            kind,
+            role,
+            tokens: 0,
+            toks,
+        }
+    }
+
+    /// A tool result establishes the token, the assistant names it six blocks on.
+    fn establish_then_reuse(tok: u32) -> Session {
+        let mut blocks = vec![block(0, Role::Assistant, Kind::ToolResult, vec![tok])];
+        for i in 1..6 {
+            blocks.push(block(i, Role::Assistant, Kind::Text, vec![]));
+        }
+        blocks.push(block(6, Role::Assistant, Kind::ToolUse, vec![tok]));
+        session(blocks)
+    }
+
+    /// `/tmp/t3.txt` passes the length, digit and letter floors, and each literal
+    /// sits in one session, but the digit is a task counter: a model that has seen
+    /// `/tmp/t2.txt` can produce `/tmp/t3.txt` without having read it. Rarity is
+    /// counted over the pattern the digits fill, so the family is common even when
+    /// each member is rare. A hash has no siblings and stays a probe.
+    #[test]
+    fn a_numbered_family_is_not_rare_even_when_each_member_is() {
+        let mut it = Interner::default();
+        let counters: Vec<u32> = (1..=4)
+            .map(|n| it.intern(&format!("/tmp/t{n}.txt")))
+            .collect();
+        let hash = it.intern("a7f3c9e21b84");
+        let mut all: Vec<Session> = counters.iter().map(|&t| establish_then_reuse(t)).collect();
+        all.push(establish_then_reuse(hash));
+        let sessions: Vec<&Session> = all.iter().collect();
+
+        let probes = harvest(&sessions, &it.family, 3, 5);
+
+        let from_counters: usize = probes[..4].iter().map(Vec::len).sum();
+        assert_eq!(from_counters, 0, "a numbered family counted as rare");
+        assert_eq!(probes[4].len(), 1, "a token with no siblings was dropped");
+    }
 }

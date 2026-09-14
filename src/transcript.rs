@@ -60,6 +60,25 @@ pub struct Session {
 pub struct Interner {
     map: HashMap<String, u32>,
     pub names: Vec<String>,
+    skeletons: HashMap<String, u32>,
+    /// Token id to the id of its skeleton, shared by every token that differs from
+    /// it only in its digits.
+    pub family: Vec<u32>,
+}
+
+/// The token with every run of digits collapsed to `#`, so `/tmp/t3.txt` and
+/// `/tmp/t12.txt` share one. `#` is never an identifier character, so it cannot
+/// collide with a literal.
+fn skeleton(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if !c.is_ascii_digit() {
+            out.push(c);
+        } else if !out.ends_with('#') {
+            out.push('#');
+        }
+    }
+    out
 }
 
 impl Interner {
@@ -68,6 +87,9 @@ impl Interner {
             return i;
         }
         let i = self.names.len() as u32;
+        let next = self.skeletons.len() as u32;
+        let f = *self.skeletons.entry(skeleton(s)).or_insert(next);
+        self.family.push(f);
         self.names.push(s.to_string());
         self.map.insert(s.to_string(), i);
         i
