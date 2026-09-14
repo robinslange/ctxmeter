@@ -68,6 +68,11 @@ enum Cmd {
         /// Required to spend money.
         #[arg(long)]
         yes: bool,
+        /// Print the fact under test and each raw response, so the verdict can be
+        /// checked by eye instead of taken on trust. This prints probe text,
+        /// which every other command deliberately does not.
+        #[arg(long)]
+        show_raw: bool,
         #[arg(long, default_value_t = 3)]
         max_df: usize,
         #[arg(long, default_value_t = 5)]
@@ -310,6 +315,7 @@ struct CfArgs {
     sample: usize,
     dry_run: bool,
     yes: bool,
+    show_raw: bool,
     max_df: usize,
     min_gap: usize,
 }
@@ -329,8 +335,14 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
     };
     let cases = counterfactual::build_cases(&corpus, pol, a.sample, &a.model, &mut dropped);
     if cases.is_empty() {
-        println!("No usable cases. The policy did not remove any harvested fact,");
-        println!("or no session could be rebuilt into a valid request.");
+        println!(
+            "No usable cases, out of {} probes considered:",
+            dropped.considered
+        );
+        println!("  unrebuildable  : {}", dropped.unrebuildable);
+        println!("  other model    : {}", dropped.other_model);
+        println!("  policy kept it : {}", dropped.policy_kept_the_fact);
+        println!("  no re-fetch tgt: {}", dropped.no_refetch_target);
         return 1;
     }
 
@@ -348,6 +360,7 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
     println!("  unrebuildable  : {}", dropped.unrebuildable);
     println!("  other model    : {}", dropped.other_model);
     println!("  policy kept it : {}", dropped.policy_kept_the_fact);
+    println!("  no re-fetch tgt: {}", dropped.no_refetch_target);
     println!("cases built      : {}", cases.len());
     println!("input tokens     : {toks} across both arms");
     println!("estimated spend  : ${cost:.2}  (published prices, checked 2026-09-14)");
@@ -366,15 +379,55 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
         for (m, n) in models {
             println!("  {m}  {n}");
         }
+        let mut bad = 0;
+        for (i, c) in cases.iter().enumerate() {
+            for (arm, msgs) in [
+                ("intact", &c.messages_intact),
+                ("masked", &c.messages_masked),
+            ] {
+                if let Some(why) = counterfactual::invalid(msgs) {
+                    if bad < 5 {
+                        println!("\ncase {i} {arm} is not a sendable request: {why}");
+                    }
+                    bad += 1;
+                }
+            }
+        }
+        if bad > 0 {
+            println!("\n{bad} arm(s) would be rejected by the API. Counting them all rather");
+            println!("than stopping at the first: one is a bug, and the rate is the news.");
+        }
+        println!(
+            "\nall {} cases satisfy the request invariants.",
+            cases.len()
+        );
+        let mut turns: Vec<(usize, u32)> = cases.iter().map(|c| (c.session, c.cut)).collect();
+        turns.sort_unstable();
+        turns.dedup();
+        let mut sess: Vec<usize> = cases.iter().map(|c| c.session).collect();
+        sess.sort_unstable();
+        sess.dedup();
+        println!(
+            "{} cases over {} distinct replayed turns in {} sessions.",
+            cases.len(),
+            turns.len(),
+            sess.len()
+        );
+        if turns.len() < cases.len() {
+            println!(
+                "cases sharing a turn share a request: one observation scored more than once."
+            );
+        }
         let (a, b) = counterfactual::estimate_tokens(&cases[0]);
         println!(
             "\nfirst case: {} messages intact ({a} tok), masked ({b} tok)",
             cases[0].messages_intact.len()
         );
         println!(
-            "fact length {} chars, origin tool {:?}",
+            "fact length {} chars, origin tool {:?}, target known {}",
             cases[0].fact.len(),
-            cases[0].origin_tool
+            cases[0].origin_tool,
+            !cases[0].origin_target.is_empty()
         );
         println!("\ndry run: nothing was sent.");
         return 0;
@@ -393,13 +446,35 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
         return 2;
     }
 
-    let v = counterfactual::run(&cases, &key);
-    println!("\n{:<26}{:>8}", "cases attempted", cases.len());
+    let v = counterfactual::run(&cases, &key, a.show_raw);
+    let attempted = v.informative + v.discarded + v.unusable;
+    if !v.errors.is_empty() {
+        eprintln!("\nThe run stopped: the API did not accept a request.");
+        for e in &v.errors {
+            eprintln!("  {e}");
+        }
+        eprintln!("\nThis is a bug in the rebuild, not a result about the policy.");
+        if attempted == 0 {
+            return 3;
+        }
+        eprintln!("{attempted} case(s) completed before it, reported below.");
+    }
+    println!("\n{:<26}{:>8}", "cases attempted", attempted);
     println!("{:<26}{:>8}", "discarded (control failed)", v.discarded);
+    println!("{:<26}{:>8}", "unusable (truncated)", v.unusable);
     println!("{:<26}{:>8}", "informative", v.informative);
+    if v.measured_tokens > 0 {
+        println!(
+            "\ninput tokens: {} measured by count_tokens, {toks} estimated",
+            v.measured_tokens
+        );
+    }
     if v.informative == 0 {
         println!("\nNo informative cases. Nothing can be concluded.");
         return 1;
+    }
+    if !v.errors.is_empty() {
+        println!("\nThe sample below is what completed, not what was asked for.");
     }
     let p = |n: usize| format!("{:.1}%", n as f64 / v.informative as f64 * 100.0);
     println!("\nof the informative cases, with the fact removed the model:");
@@ -585,6 +660,7 @@ fn main() {
             sample,
             dry_run,
             yes,
+            show_raw,
             max_df,
             min_gap,
         } => cmd_counterfactual(
@@ -596,6 +672,7 @@ fn main() {
                 sample,
                 dry_run,
                 yes,
+                show_raw,
                 max_df,
                 min_gap,
             },

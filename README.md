@@ -117,6 +117,9 @@ printed. Of the cases that survive, the outcome splits three ways:
 
 - **Reproduced anyway.** The model did not need the context to get there.
 - **Went to fetch it.** It noticed something was missing. The healthy failure.
+  Counted only when the next action names what produced the fact. Matching on the
+  tool name instead would score most of a coding corpus as a re-fetch, since most
+  of it is `Read`, and that error lands entirely in this bucket.
 - **Neither.** The fact was gone and the model did not ask for it back.
 
 ```bash
@@ -132,9 +135,17 @@ retention figure conflates them. That also happens to be where most of the cost
 lives: an Opus-class case runs about five times a Sonnet-class one. As a rough
 guide on one corpus, 133 cases came to about $31.
 
-The printed estimate is an upper bound. Cases are ordered so that consecutive
-control arms from the same session extend the previous prefix and read most of
-their context from cache, and the estimate does not model that discount.
+The estimate is approximate in both directions, and the run prints the measured
+count beside it. Cases are ordered so that consecutive control arms from the same
+session extend the previous prefix and read most of their context from cache, and
+the estimate models neither that discount nor the cache write that precedes it. It
+counts both arms of every case, while a case whose control arm fails never buys
+its second arm. Against it, token counts come from serialized length rather than
+the tokenizer: on the first measured case that ran 1.6x low.
+
+Before either paid call, both arms go to `/v1/messages/count_tokens`, which is
+free. It answers the only question worth answering first, which is whether the API
+accepts what was rebuilt, and it returns the measured count.
 
 It needs a real API key. It will not read a Claude subscription credential,
 because Anthropic's terms do not permit using Free, Pro or Max OAuth tokens in
@@ -209,8 +220,12 @@ and never printed. Every command emits aggregate numbers only, to stdout, and
 writes nothing.
 
 `counterfactual` is the single exception, and it is opt-in: it sends
-reconstructed context to the Anthropic API, using your key. The dry run sends
-nothing at all.
+reconstructed context to the Anthropic API, using your key, and writes each
+request body to a 0600 file in the temp directory for the length of one call
+because that is how the key is kept out of the process list. The dry run sends
+nothing at all. `--show-raw` prints the probe token and the model's replies, and
+exists so a verdict can be checked by eye rather than trusted; nothing else in the
+tool prints probe text.
 
 ## Results from one workload
 
