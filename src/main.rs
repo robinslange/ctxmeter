@@ -321,16 +321,13 @@ fn cmd_counterfactual(all: &[Session], names: &[String], a: CfArgs) -> i32 {
     let pol = probes::Policy::KeepLast(a.keep_last);
 
     let mut dropped = counterfactual::Dropped::default();
-    let cases = counterfactual::build_cases(
-        &sessions,
-        &probes,
-        &paths,
-        names,
-        pol,
-        a.sample,
-        &a.model,
-        &mut dropped,
-    );
+    let corpus = counterfactual::Corpus {
+        sessions: &sessions,
+        probes: &probes,
+        paths: &paths,
+        interned: names,
+    };
+    let cases = counterfactual::build_cases(&corpus, pol, a.sample, &a.model, &mut dropped);
     if cases.is_empty() {
         println!("No usable cases. The policy did not remove any harvested fact,");
         println!("or no session could be rebuilt into a valid request.");

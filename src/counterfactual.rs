@@ -257,16 +257,23 @@ fn apply_mask(msgs: &[serde_json::Value], keep: &Policy) -> Vec<serde_json::Valu
     out
 }
 
+/// The corpus a run draws from, kept together so the selection knobs stay
+/// legible in the signature.
+pub struct Corpus<'a> {
+    pub sessions: &'a [&'a Session],
+    pub probes: &'a [Vec<Probe>],
+    pub paths: &'a [String],
+    pub interned: &'a [String],
+}
+
 pub fn build_cases(
-    sessions: &[&Session],
-    probes: &[Vec<Probe>],
-    paths: &[String],
-    interned: &[String],
+    c: &Corpus,
     pol: Policy,
     sample: usize,
     model_filter: &str,
     dropped: &mut Dropped,
 ) -> Vec<Case> {
+    let (sessions, probes, paths, interned) = (c.sessions, c.probes, c.paths, c.interned);
     let mut flat: Vec<(usize, &Probe)> = Vec::new();
     for (si, ps) in probes.iter().enumerate() {
         // Pooling two model families into one retention figure conflates them,
