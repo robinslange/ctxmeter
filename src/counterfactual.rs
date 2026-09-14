@@ -347,6 +347,27 @@ pub struct Corpus<'a> {
     pub interned: &'a [String],
 }
 
+/// Interleave turns so that a sample of n covers as many sessions as it can.
+/// Ordering by session takes every turn of the first before any of the second,
+/// and ordering by position within a trace spreads nothing, because one long
+/// session holds most of the eligible turns at every position.
+fn round_robin(keys: &[(usize, u32)]) -> Vec<(usize, u32)> {
+    let mut sorted = keys.to_vec();
+    sorted.sort_unstable();
+    let mut ranked: Vec<(usize, usize, u32)> = Vec::with_capacity(sorted.len());
+    let mut rank = 0;
+    for (i, &(s, c)) in sorted.iter().enumerate() {
+        rank = if i > 0 && sorted[i - 1].0 == s {
+            rank + 1
+        } else {
+            0
+        };
+        ranked.push((rank, s, c));
+    }
+    ranked.sort_unstable();
+    ranked.into_iter().map(|(_, s, c)| (s, c)).collect()
+}
+
 pub fn build_cases(
     c: &Corpus,
     pol: Policy,
@@ -379,8 +400,8 @@ pub fn build_cases(
             turns.entry((si, cut)).or_default().push(p);
         }
     }
-    let mut order: Vec<(usize, u32)> = turns.keys().copied().collect();
-    order.sort_unstable();
+    let keys: Vec<(usize, u32)> = turns.keys().copied().collect();
+    let order = round_robin(&keys);
 
     let mut out: Vec<Case> = Vec::new();
     for (si, cut) in order {
@@ -1089,6 +1110,19 @@ mod tests {
         assert_eq!(
             file_in("grep -m1 status /home/dev/notes/index.md 2>/dev/null"),
             Some("/home/dev/notes/index.md".into())
+        );
+    }
+
+    /// One turn from every session before a second from any, so a small sample is
+    /// not three observations from one long research session wearing five hats.
+    /// Within a session the original order survives, which keeps consecutive control
+    /// arms extending each other's cached prefix.
+    #[test]
+    fn selection_takes_one_turn_per_session_before_a_second() {
+        let keys = [(0, 10), (0, 20), (0, 30), (1, 5), (2, 7), (2, 9)];
+        assert_eq!(
+            round_robin(&keys),
+            vec![(0, 10), (1, 5), (2, 7), (0, 20), (2, 9), (0, 30)]
         );
     }
 }
