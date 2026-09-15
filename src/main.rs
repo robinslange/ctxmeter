@@ -20,6 +20,9 @@ struct Cli {
     /// Directory of .jsonl transcripts (default: ~/.claude/projects)
     #[arg(long, global = true)]
     root: Option<PathBuf>,
+    /// Print one JSON document instead of the report.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -112,7 +115,14 @@ fn pct(x: f64) -> String {
     format!("{:.2}%", x * 100.0)
 }
 
-fn cmd_summary(sessions: &[Session]) {
+fn emit(doc: serde_json::Value) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&doc).expect("a Value always serializes")
+    );
+}
+
+fn cmd_summary(sessions: &[Session], json: bool) {
     let (mut read, mut write, mut fresh, mut out, mut turns) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut models: Vec<(String, u64)> = Vec::new();
     let mut n_sessions = 0;
@@ -135,6 +145,30 @@ fn cmd_summary(sessions: &[Session]) {
     }
     let tot = (read + write + fresh) as f64;
     let cost = fresh as f64 + 1.25 * write as f64 + 0.10 * read as f64;
+    models.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    if json {
+        let share = |v: u64| v as f64 / tot * 100.0;
+        emit(serde_json::json!({
+            "turns": turns,
+            "sessions": n_sessions,
+            "tokens": { "fresh": fresh, "write": write, "read": read, "output": out },
+            "share": { "fresh": share(fresh), "write": share(write), "read": share(read) },
+            "billed": {
+                "fresh": fresh as f64,
+                "write": 1.25 * write as f64,
+                "read": 0.10 * read as f64,
+                "total": cost,
+            },
+            "no_cache_total": tot,
+            "cache_hit_rate": share(read),
+            "caching_saves": (1.0 - cost / tot) * 100.0,
+            "models": models
+                .iter()
+                .map(|(m, n)| (m.clone(), serde_json::json!(n)))
+                .collect::<serde_json::Map<_, _>>(),
+        }));
+        return;
+    }
     println!("turns {turns}   sessions {n_sessions}");
     println!(
         "\n{:<10}{:>18}{:>10}{:>18}",
@@ -157,7 +191,6 @@ fn cmd_summary(sessions: &[Session]) {
     println!("\ncache hit rate      {}", pct(read as f64 / tot));
     println!("billed equivalents  {cost:.0}  (no-cache counterfactual {tot:.0})");
     println!("caching already saves {}", pct(1.0 - cost / tot));
-    models.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
     let list: Vec<String> = models
         .iter()
         .take(4)
@@ -166,7 +199,7 @@ fn cmd_summary(sessions: &[Session]) {
     println!("\nmodels: {}", list.join(", "));
 }
 
-fn cmd_floor(sessions: &[Session]) {
+fn cmd_floor(sessions: &[Session], json: bool) {
     let mut all: Vec<u64> = Vec::new();
     let mut by: Vec<(String, Vec<u64>)> = Vec::new();
     for s in sessions {
@@ -185,27 +218,42 @@ fn cmd_floor(sessions: &[Session]) {
         }
     }
     all.sort_unstable();
-    println!("first-turn billed prefix, n={}", all.len());
-    for q in [25, 50, 75, 90] {
-        println!("  p{q}: {:>10}", all[all.len() * q / 100]);
-    }
     by.sort_by(|a, b| a.0.cmp(&b.0));
+    let months: Vec<(String, usize, u64, u64)> = by
+        .into_iter()
+        .filter(|(_, v)| v.len() >= 15)
+        .map(|(mo, mut v)| {
+            v.sort_unstable();
+            (mo, v.len(), v[v.len() / 2], v[v.len() * 9 / 10])
+        })
+        .collect();
+    let q = |p: usize| all[all.len() * p / 100];
+    if json {
+        emit(serde_json::json!({
+            "n": all.len(),
+            "p25": q(25),
+            "p50": q(50),
+            "p75": q(75),
+            "p90": q(90),
+            "months": months
+                .iter()
+                .map(|(mo, n, med, p90)| {
+                    (mo.clone(), serde_json::json!({ "sessions": n, "median": med, "p90": p90 }))
+                })
+                .collect::<serde_json::Map<_, _>>(),
+        }));
+        return;
+    }
+    println!("first-turn billed prefix, n={}", all.len());
+    for p in [25, 50, 75, 90] {
+        println!("  p{p}: {:>10}", q(p));
+    }
     println!(
         "\n{:<10}{:>10}{:>12}{:>12}",
         "month", "sessions", "median", "p90"
     );
-    for (mo, mut v) in by {
-        if v.len() < 15 {
-            continue;
-        }
-        v.sort_unstable();
-        println!(
-            "{:<10}{:>10}{:>12}{:>12}",
-            mo,
-            v.len(),
-            v[v.len() / 2],
-            v[v.len() * 9 / 10]
-        );
+    for (mo, n, med, p90) in &months {
+        println!("{:<10}{:>10}{:>12}{:>12}", mo, n, med, p90);
     }
     println!("\nthis is re-read every turn and no proxy can compress it.");
     println!("attribute it by changing config and re-running: tool definitions");
@@ -768,6 +816,7 @@ fn cmd_robustness(all: &[Session], family: &[u32], max_df: usize, min_gap: usize
 fn main() {
     allow_sigpipe();
     let cli = Cli::parse();
+    let json = cli.json;
     let root = cli.root.unwrap_or_else(default_root);
     let mut it = Interner::default();
     let sessions = transcript::load(&root, &mut it);
@@ -777,11 +826,11 @@ fn main() {
     }
     let code = match cli.cmd {
         Cmd::Summary => {
-            cmd_summary(&sessions);
+            cmd_summary(&sessions, json);
             0
         }
         Cmd::Floor => {
-            cmd_floor(&sessions);
+            cmd_floor(&sessions, json);
             0
         }
         Cmd::Probes { max_df, min_gap } => cmd_probes(&sessions, &it.family, max_df, min_gap),

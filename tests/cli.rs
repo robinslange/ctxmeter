@@ -98,3 +98,48 @@ fn counterfactual_dry_run_text_is_unchanged() {
         0,
     );
 }
+
+fn json(args: &[&str], code: i32) -> serde_json::Value {
+    let (c, out, err) = ctxmeter(args);
+    assert_eq!(c, code, "{args:?} exit code\n{err}");
+    serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("{args:?} stdout is not one JSON document: {e}\n{out}"))
+}
+
+fn close(v: &serde_json::Value, want: f64, tol: f64) {
+    let got = v.as_f64().unwrap_or_else(|| panic!("not a number: {v}"));
+    assert!(
+        (got - want).abs() <= tol,
+        "got {got}, want {want} within {tol}"
+    );
+}
+
+#[test]
+fn summary_json() {
+    let v = json(&["summary", "--root", CORPUS, "--json"], 0);
+    assert_eq!(v["turns"], 4);
+    assert_eq!(v["sessions"], 1);
+    assert_eq!(v["tokens"]["fresh"], 24);
+    assert_eq!(v["tokens"]["write"], 20250);
+    assert_eq!(v["tokens"]["read"], 56500);
+    assert_eq!(v["tokens"]["output"], 233);
+    close(&v["share"]["read"], 73.59, 0.005);
+    close(&v["share"]["write"], 26.38, 0.005);
+    close(&v["billed"]["write"], 25312.5, 1e-9);
+    close(&v["billed"]["read"], 5650.0, 1e-6);
+    close(&v["billed"]["total"], 30986.5, 1e-6);
+    close(&v["no_cache_total"], 76774.0, 1e-9);
+    close(&v["cache_hit_rate"], 73.59, 0.005);
+    close(&v["caching_saves"], 59.64, 0.005);
+    assert_eq!(v["models"]["claude-sonnet-5"], 4);
+}
+
+#[test]
+fn floor_json() {
+    let v = json(&["floor", "--root", CORPUS, "--json"], 0);
+    assert_eq!(v["n"], 1);
+    for q in ["p25", "p50", "p75", "p90"] {
+        assert_eq!(v[q], 18012, "{q}");
+    }
+    assert_eq!(v["months"], serde_json::json!({}));
+}
