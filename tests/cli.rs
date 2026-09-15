@@ -143,3 +143,128 @@ fn floor_json() {
     }
     assert_eq!(v["months"], serde_json::json!({}));
 }
+
+const POLICIES: [&str; 10] = [
+    "keep_last_1",
+    "keep_last_3",
+    "keep_last_5",
+    "keep_last_10",
+    "keep_last_25",
+    "keep_last_50",
+    "tail_budget_10k",
+    "tail_budget_40k",
+    "tail_budget_100k",
+    "tail_budget_200k",
+];
+
+fn keys(v: &serde_json::Value) -> Vec<&str> {
+    v.as_object()
+        .unwrap_or_else(|| panic!("not an object: {v}"))
+        .keys()
+        .map(|k| k.as_str())
+        .collect()
+}
+
+#[test]
+fn probes_json() {
+    let v = json(&["probes", "--root", CORPUS, "--json"], 0);
+    assert_eq!(v["sessions_scanned"], 1);
+    assert_eq!(v["sessions_yielding"], 1);
+    assert_eq!(v["probes"], 1);
+    assert_eq!(v["max_df"], 3);
+    assert_eq!(v["min_gap"], 5);
+    close(&v["per_session"], 1.0, 1e-9);
+    assert_eq!(v["gap"]["p50"], 8);
+    assert_eq!(v["depth"]["p50"], 7);
+    assert_eq!(keys(&v["policies"]), POLICIES);
+    let p = &v["policies"];
+    assert_eq!(p["keep_last_1"]["probes"], 1);
+    assert_eq!(p["keep_last_1"]["destroyed"], 1);
+    close(&p["keep_last_1"]["retained"], 0.0, 1e-9);
+    close(&p["keep_last_3"]["retained"], 100.0, 1e-9);
+    close(&p["keep_last_3"]["shallow"], 100.0, 1e-9);
+    assert!(p["keep_last_3"]["deep"].is_null());
+    assert_eq!(p["keep_last_3"]["kind"], "keep_last");
+    assert_eq!(p["keep_last_3"]["keep_last"], 3);
+    assert_eq!(p["tail_budget_10k"]["kind"], "tail_budget");
+    assert_eq!(p["tail_budget_10k"]["budget_tokens"], 10000);
+}
+
+#[test]
+fn an_empty_harvest_leaves_stdout_empty_in_json_mode() {
+    let (c, out, err) = ctxmeter(&["probes", "--root", CORPUS, "--max-df", "0", "--json"]);
+    assert_eq!(c, 1);
+    assert_eq!(out, "");
+    assert!(err.contains("NO PROBES HARVESTED"), "{err}");
+}
+
+#[test]
+fn tradeoff_json() {
+    let v = json(&["tradeoff", "--root", CORPUS, "--json"], 0);
+    assert_eq!(v["sessions"], 1);
+    assert_eq!(v["probes"], 1);
+    close(&v["baseline_billed"], 28610.0, 0.5);
+    assert_eq!(keys(&v["policies"]), POLICIES);
+    let k1 = &v["policies"]["keep_last_1"];
+    close(&k1["cost_saved"], -0.2, 0.05);
+    close(&k1["retained"], 0.0, 1e-9);
+    close(&k1["lost"], 100.0, 1e-9);
+    assert_eq!(k1["kind"], "keep_last");
+}
+
+#[test]
+fn robustness_json() {
+    let v = json(&["robustness", "--root", CORPUS, "--json"], 0);
+    for table in ["cost_model", "estimator", "uncertainty"] {
+        assert_eq!(keys(&v[table]), POLICIES, "{table}");
+    }
+    close(
+        &v["cost_model"]["keep_last_1"]["longest_prefix"],
+        -0.2,
+        0.05,
+    );
+    close(
+        &v["cost_model"]["keep_last_1"]["all_or_nothing"],
+        -0.5,
+        0.05,
+    );
+    close(&v["estimator"]["keep_last_1"]["x1"], -0.2, 0.05);
+    close(&v["estimator"]["keep_last_1"]["x2"], -0.1, 0.05);
+    let u = &v["uncertainty"]["keep_last_3"];
+    close(&u["retained"], 100.0, 1e-9);
+    close(&u["ci_lo"], 100.0, 1e-9);
+    close(&u["ci_hi"], 100.0, 1e-9);
+    assert_eq!(u["sessions"], 1);
+}
+
+#[test]
+fn sensitivity_json() {
+    let v = json(&["sensitivity", "--root", CORPUS, "--json"], 0);
+    let conditions = v["conditions"].as_array().expect("an array");
+    assert_eq!(conditions.len(), 3);
+    assert_eq!(conditions[0]["max_df"], 1);
+    assert_eq!(conditions[0]["min_gap"], 5);
+    assert_eq!(conditions[0]["probes"], 1);
+    assert_eq!(keys(&conditions[0]["retained"]), POLICIES);
+    close(&conditions[0]["retained"]["keep_last_1"], 0.0, 1e-9);
+    assert_eq!(v["ranking"][0], "keep_last_3");
+    assert_eq!(v["ranking"][9], "keep_last_1");
+    assert_eq!(v["moved"], 0);
+    assert_eq!(v["stable"], true);
+}
+
+#[test]
+fn retention_and_cost_agree_across_commands() {
+    let probes = json(&["probes", "--root", CORPUS, "--json"], 0);
+    let tradeoff = json(&["tradeoff", "--root", CORPUS, "--json"], 0);
+    let robustness = json(&["robustness", "--root", CORPUS, "--json"], 0);
+    assert_eq!(probes["probes"], tradeoff["probes"]);
+    assert_eq!(probes["sessions_scanned"], tradeoff["sessions"]);
+    for p in POLICIES {
+        let r = probes["policies"][p]["retained"].as_f64().unwrap();
+        close(&tradeoff["policies"][p]["retained"], r, 1e-9);
+        close(&robustness["uncertainty"][p]["retained"], r, 1e-9);
+        let saved = tradeoff["policies"][p]["cost_saved"].as_f64().unwrap();
+        close(&robustness["cost_model"][p]["longest_prefix"], saved, 1e-9);
+    }
+}

@@ -5,7 +5,7 @@ mod transcript;
 use clap::{Parser, Subcommand};
 use probes::{
     billed_cost, billed_cost_with, bootstrap_ci, default_policies, eligible, harvest, retention,
-    retention_by_session, CacheModel, CostOpts,
+    retention_by_session, CacheModel, CostOpts, Policy,
 };
 use std::path::PathBuf;
 use transcript::{Interner, Session};
@@ -120,6 +120,24 @@ fn emit(doc: serde_json::Value) {
         "{}",
         serde_json::to_string_pretty(&doc).expect("a Value always serializes")
     );
+}
+
+fn by_policy(rows: impl IntoIterator<Item = (Policy, serde_json::Value)>) -> serde_json::Value {
+    rows.into_iter()
+        .map(|(pol, fields)| {
+            let mut doc = match pol {
+                Policy::KeepLast(n) => serde_json::json!({ "kind": "keep_last", "keep_last": n }),
+                Policy::TailBudget(b) => {
+                    serde_json::json!({ "kind": "tail_budget", "budget_tokens": b })
+                }
+            };
+            if let (Some(d), serde_json::Value::Object(f)) = (doc.as_object_mut(), fields) {
+                d.extend(f);
+            }
+            (pol.label(), doc)
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into()
 }
 
 fn cmd_summary(sessions: &[Session], json: bool) {
@@ -260,20 +278,26 @@ fn cmd_floor(sessions: &[Session], json: bool) {
     println!("never appear in a transcript.");
 }
 
-fn cmd_probes(all: &[Session], family: &[u32], max_df: usize, min_gap: usize) -> i32 {
+fn cmd_probes(all: &[Session], family: &[u32], max_df: usize, min_gap: usize, json: bool) -> i32 {
     let sessions = eligible(all);
     let probes = harvest(&sessions, family, max_df, min_gap);
     let n: usize = probes.iter().map(|v| v.len()).sum();
     let yielding = probes.iter().filter(|v| !v.is_empty()).count();
-    println!(
+    let head = format!(
         "sessions scanned {}   yielding probes {}   probes {}",
         sessions.len(),
         yielding,
         n
     );
     if n == 0 {
-        println!("\nNO PROBES HARVESTED. Loud failure by design: an empty denominator must");
-        println!("never read as a pass. Relax --max-df or lower --min-gap.");
+        let msg = format!(
+            "{head}\n\nNO PROBES HARVESTED. Loud failure by design: an empty denominator must\nnever read as a pass. Relax --max-df or lower --min-gap."
+        );
+        if json {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
         return 1;
     }
     let mut gaps: Vec<usize> = probes
@@ -282,17 +306,6 @@ fn cmd_probes(all: &[Session], family: &[u32], max_df: usize, min_gap: usize) ->
         .map(|p| p.use_at - p.origin)
         .collect();
     gaps.sort_unstable();
-    println!(
-        "probes per scanned session {:.2}   (token in <= {} sessions)",
-        n as f64 / sessions.len() as f64,
-        max_df
-    );
-    println!(
-        "gap from established to needed, in blocks: p50 {}  p90 {}  max {}",
-        gaps[gaps.len() / 2],
-        gaps[gaps.len() * 9 / 10],
-        gaps[gaps.len() - 1]
-    );
 
     // How deep into its session each reuse sits, counted in messages, which is where
     // tier two cuts. It is reported because the two halves are not interchangeable:
@@ -307,12 +320,6 @@ fn cmd_probes(all: &[Session], family: &[u32], max_df: usize, min_gap: usize) ->
     }
     depths.sort_unstable();
     let median = depths[depths.len() / 2];
-    println!(
-        "depth of the reuse, in messages: p50 {}  p90 {}  max {}\n",
-        median,
-        depths[depths.len() * 9 / 10],
-        depths[depths.len() - 1]
-    );
 
     let split = |deep: bool| -> Vec<Vec<probes::Probe>> {
         sessions
@@ -334,33 +341,83 @@ fn cmd_probes(all: &[Session], family: &[u32], max_df: usize, min_gap: usize) ->
             .collect()
     };
     let (shallow, deep) = (split(false), split(true));
+    let share = |k: u64, t: u64| (t > 0).then(|| k as f64 / t as f64 * 100.0);
+    let rows: Vec<_> = default_policies()
+        .into_iter()
+        .filter_map(|pol| {
+            let (kept, total) = retention(&sessions, &probes, pol);
+            if total == 0 {
+                return None;
+            }
+            let (sk, st) = retention(&sessions, &shallow, pol);
+            let (dk, dt) = retention(&sessions, &deep, pol);
+            Some((pol, kept, total, share(sk, st), share(dk, dt)))
+        })
+        .collect();
 
+    if json {
+        emit(serde_json::json!({
+            "sessions_scanned": sessions.len(),
+            "sessions_yielding": yielding,
+            "probes": n,
+            "per_session": n as f64 / sessions.len() as f64,
+            "max_df": max_df,
+            "min_gap": min_gap,
+            "gap": {
+                "p50": gaps[gaps.len() / 2],
+                "p90": gaps[gaps.len() * 9 / 10],
+                "max": gaps[gaps.len() - 1],
+            },
+            "depth": {
+                "p50": median,
+                "p90": depths[depths.len() * 9 / 10],
+                "max": depths[depths.len() - 1],
+            },
+            "policies": by_policy(rows.iter().map(|&(pol, kept, total, sh, dp)| {
+                (pol, serde_json::json!({
+                    "probes": total,
+                    "destroyed": total - kept,
+                    "retained": kept as f64 / total as f64 * 100.0,
+                    "shallow": sh,
+                    "deep": dp,
+                }))
+            })),
+        }));
+        return 0;
+    }
+
+    println!("{head}");
+    println!(
+        "probes per scanned session {:.2}   (token in <= {} sessions)",
+        n as f64 / sessions.len() as f64,
+        max_df
+    );
+    println!(
+        "gap from established to needed, in blocks: p50 {}  p90 {}  max {}",
+        gaps[gaps.len() / 2],
+        gaps[gaps.len() * 9 / 10],
+        gaps[gaps.len() - 1]
+    );
+    println!(
+        "depth of the reuse, in messages: p50 {}  p90 {}  max {}\n",
+        median,
+        depths[depths.len() * 9 / 10],
+        depths[depths.len() - 1]
+    );
     println!(
         "{:<20}{:>10}{:>12}{:>11}{:>13}{:>10}",
         "policy", "probes", "destroyed", "retained", "shallow", "deep"
     );
-    for pol in default_policies() {
-        let (kept, total) = retention(&sessions, &probes, pol);
-        if total == 0 {
-            continue;
-        }
-        let (sk, st) = retention(&sessions, &shallow, pol);
-        let (dk, dt) = retention(&sessions, &deep, pol);
-        let share = |k: u64, t: u64| {
-            if t == 0 {
-                "n/a".into()
-            } else {
-                pct(k as f64 / t as f64)
-            }
-        };
+    let cell = |x: Option<f64>| x.map_or_else(|| "n/a".to_string(), |v| format!("{v:.2}%"));
+    for &(pol, kept, total, sh, dp) in &rows {
         println!(
             "{:<20}{:>10}{:>12}{:>11}{:>13}{:>10}",
             pol.label(),
             total,
             total - kept,
             pct(kept as f64 / total as f64),
-            share(sk, st),
-            share(dk, dt)
+            cell(sh),
+            cell(dp)
         );
     }
     println!("\nshallow = reuse at message {median} or earlier, deep = later. where the two");
@@ -374,15 +431,10 @@ fn cmd_probes(all: &[Session], family: &[u32], max_df: usize, min_gap: usize) ->
     0
 }
 
-fn cmd_sensitivity(all: &[Session], family: &[u32]) -> i32 {
+fn cmd_sensitivity(all: &[Session], family: &[u32], json: bool) -> i32 {
     let sessions = eligible(all);
     let pols = default_policies();
-    print!("{:>7}{:>6}{:>10}", "rarity", "gap", "probes");
-    for p in &pols {
-        print!("{:>18}", p.label());
-    }
-    println!();
-    let mut orders: Vec<Vec<String>> = Vec::new();
+    let mut conditions: Vec<(usize, usize, usize, Vec<f64>)> = Vec::new();
     for max_df in [1usize, 3, 10] {
         for min_gap in [5usize, 20] {
             let probes = harvest(&sessions, family, max_df, min_gap);
@@ -390,29 +442,83 @@ fn cmd_sensitivity(all: &[Session], family: &[u32]) -> i32 {
             if n == 0 {
                 continue;
             }
-            print!("{max_df:>7}{min_gap:>6}{n:>10}");
-            let mut scored: Vec<(String, f64)> = Vec::new();
-            for pol in &pols {
-                let (kept, total) = retention(&sessions, &probes, *pol);
-                let r = if total == 0 {
-                    0.0
-                } else {
-                    kept as f64 / total as f64
-                };
-                print!("{:>17.1}%", r * 100.0);
-                scored.push((pol.label(), r));
-            }
-            println!();
-            scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-            orders.push(scored.into_iter().map(|(k, _)| k).collect());
+            let rs = pols
+                .iter()
+                .map(|&pol| {
+                    let (kept, total) = retention(&sessions, &probes, pol);
+                    if total == 0 {
+                        0.0
+                    } else {
+                        kept as f64 / total as f64
+                    }
+                })
+                .collect();
+            conditions.push((max_df, min_gap, n, rs));
         }
     }
-    if orders.is_empty() {
-        println!("\nno conditions produced probes.");
+    let header = || {
+        print!("{:>7}{:>6}{:>10}", "rarity", "gap", "probes");
+        for p in &pols {
+            print!("{:>18}", p.label());
+        }
+        println!();
+    };
+    if conditions.is_empty() {
+        if json {
+            eprintln!("no conditions produced probes.");
+        } else {
+            header();
+            println!("\nno conditions produced probes.");
+        }
         return 1;
     }
+    let orders: Vec<Vec<String>> = conditions
+        .iter()
+        .map(|(_, _, _, rs)| {
+            let mut scored: Vec<(String, f64)> = pols
+                .iter()
+                .map(|p| p.label())
+                .zip(rs.iter().copied())
+                .collect();
+            scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+            scored.into_iter().map(|(k, _)| k).collect()
+        })
+        .collect();
     let base = &orders[0];
     let moved = orders.iter().filter(|o| *o != base).count();
+
+    if json {
+        emit(serde_json::json!({
+            "conditions": conditions
+                .iter()
+                .map(|(max_df, min_gap, n, rs)| {
+                    serde_json::json!({
+                        "max_df": max_df,
+                        "min_gap": min_gap,
+                        "probes": n,
+                        "retained": pols
+                            .iter()
+                            .zip(rs)
+                            .map(|(p, r)| (p.label(), serde_json::json!(r * 100.0)))
+                            .collect::<serde_json::Map<_, _>>(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "ranking": base,
+            "moved": moved,
+            "stable": moved == 0,
+        }));
+        return i32::from(moved > 0);
+    }
+
+    header();
+    for (max_df, min_gap, n, rs) in &conditions {
+        print!("{max_df:>7}{min_gap:>6}{n:>10}");
+        for r in rs {
+            print!("{:>17.1}%", r * 100.0);
+        }
+        println!();
+    }
     println!("\npolicy ranking: {}", base.join(" > "));
     if moved > 0 {
         println!(
@@ -463,7 +569,7 @@ fn cmd_counterfactual(all: &[Session], names: &[String], family: &[u32], a: CfAr
     let sessions = eligible(all);
     let probes = harvest(&sessions, family, a.max_df, a.min_gap);
     let paths: Vec<String> = sessions.iter().map(|s| s.path.clone()).collect();
-    let pol = probes::Policy::KeepLast(a.keep_last);
+    let pol = Policy::KeepLast(a.keep_last);
 
     let mut dropped = counterfactual::Dropped::default();
     let corpus = counterfactual::Corpus {
@@ -687,15 +793,42 @@ fn allow_sigpipe() {
 #[cfg(not(unix))]
 fn allow_sigpipe() {}
 
-fn cmd_tradeoff(all: &[Session], family: &[u32], max_df: usize, min_gap: usize) -> i32 {
+fn cmd_tradeoff(all: &[Session], family: &[u32], max_df: usize, min_gap: usize, json: bool) -> i32 {
     let sessions = eligible(all);
     let probes = harvest(&sessions, family, max_df, min_gap);
     let n: usize = probes.iter().map(|v| v.len()).sum();
     if n == 0 {
-        println!("NO PROBES HARVESTED; cannot report a tradeoff.");
+        if json {
+            eprintln!("NO PROBES HARVESTED; cannot report a tradeoff.");
+        } else {
+            println!("NO PROBES HARVESTED; cannot report a tradeoff.");
+        }
         return 1;
     }
     let base = billed_cost(&sessions, None);
+    let rows: Vec<(Policy, f64, f64)> = default_policies()
+        .into_iter()
+        .filter_map(|pol| {
+            let c = billed_cost(&sessions, Some(pol));
+            let (kept, total) = retention(&sessions, &probes, pol);
+            (total > 0).then(|| (pol, (1.0 - c / base) * 100.0, kept as f64 / total as f64))
+        })
+        .collect();
+    if json {
+        emit(serde_json::json!({
+            "sessions": sessions.len(),
+            "probes": n,
+            "baseline_billed": base,
+            "policies": by_policy(rows.iter().map(|&(pol, saved, r)| {
+                (pol, serde_json::json!({
+                    "cost_saved": saved,
+                    "retained": r * 100.0,
+                    "lost": (1.0 - r) * 100.0,
+                }))
+            })),
+        }));
+        return 0;
+    }
     println!(
         "{} sessions, {} probes, baseline billed cost {:.0} equivalents\n",
         sessions.len(),
@@ -706,17 +839,11 @@ fn cmd_tradeoff(all: &[Session], family: &[u32], max_df: usize, min_gap: usize) 
         "{:<20}{:>12}{:>14}{:>14}",
         "policy", "cost saved", "info retained", "info lost"
     );
-    for pol in default_policies() {
-        let c = billed_cost(&sessions, Some(pol));
-        let (kept, total) = retention(&sessions, &probes, pol);
-        if total == 0 {
-            continue;
-        }
-        let r = kept as f64 / total as f64;
+    for &(pol, saved, r) in &rows {
         println!(
             "{:<20}{:>11.1}%{:>13.1}%{:>13.1}%",
             pol.label(),
-            (1.0 - c / base) * 100.0,
+            saved,
             r * 100.0,
             (1.0 - r) * 100.0
         );
@@ -728,14 +855,82 @@ fn cmd_tradeoff(all: &[Session], family: &[u32], max_df: usize, min_gap: usize) 
     0
 }
 
-fn cmd_robustness(all: &[Session], family: &[u32], max_df: usize, min_gap: usize) -> i32 {
+fn cmd_robustness(
+    all: &[Session],
+    family: &[u32],
+    max_df: usize,
+    min_gap: usize,
+    json: bool,
+) -> i32 {
     let sessions = eligible(all);
     let probes = harvest(&sessions, family, max_df, min_gap);
     if probes.iter().all(|v| v.is_empty()) {
-        println!("NO PROBES HARVESTED.");
+        if json {
+            eprintln!("NO PROBES HARVESTED.");
+        } else {
+            println!("NO PROBES HARVESTED.");
+        }
         return 1;
     }
     let pols = default_policies();
+    let saved = |pol: Policy, model: CacheModel, scale: f64| {
+        let o = CostOpts { model, scale };
+        let base = billed_cost_with(&sessions, None, &o);
+        let c = billed_cost_with(&sessions, Some(pol), &o);
+        (1.0 - c / base) * 100.0
+    };
+    let cost_model: Vec<(Policy, f64, f64)> = pols
+        .iter()
+        .map(|&p| {
+            (
+                p,
+                saved(p, CacheModel::LongestPrefix, 1.0),
+                saved(p, CacheModel::AllOrNothing, 1.0),
+            )
+        })
+        .collect();
+    let estimator: Vec<(Policy, [f64; 3])> = pols
+        .iter()
+        .map(|&p| {
+            (
+                p,
+                [1.0, 2.0, 3.0].map(|sc| saved(p, CacheModel::LongestPrefix, sc)),
+            )
+        })
+        .collect();
+    let uncertainty: Vec<(Policy, f64, f64, f64, usize)> = pols
+        .iter()
+        .filter_map(|&p| {
+            let per = retention_by_session(&sessions, &probes, p);
+            let (kept, total) = retention(&sessions, &probes, p);
+            if total == 0 {
+                return None;
+            }
+            let (lo, hi) = bootstrap_ci(&per, 2000);
+            Some((
+                p,
+                kept as f64 / total as f64 * 100.0,
+                lo * 100.0,
+                hi * 100.0,
+                per.len(),
+            ))
+        })
+        .collect();
+
+    if json {
+        emit(serde_json::json!({
+            "cost_model": by_policy(cost_model.iter().map(|&(p, lp, aon)| {
+                (p, serde_json::json!({ "longest_prefix": lp, "all_or_nothing": aon }))
+            })),
+            "estimator": by_policy(estimator.iter().map(|&(p, [x1, x2, x3])| {
+                (p, serde_json::json!({ "x1": x1, "x2": x2, "x3": x3 }))
+            })),
+            "uncertainty": by_policy(uncertainty.iter().map(|&(p, r, lo, hi, s)| {
+                (p, serde_json::json!({ "retained": r, "ci_lo": lo, "ci_hi": hi, "sessions": s }))
+            })),
+        }));
+        return 0;
+    }
 
     println!("1. COST MODEL. The cost column is a simulation. Does its sign survive");
     println!("   replacing generous prefix matching with the all-or-nothing behaviour");
@@ -744,44 +939,15 @@ fn cmd_robustness(all: &[Session], family: &[u32], max_df: usize, min_gap: usize
         "{:<20}{:>16}{:>16}",
         "policy", "longest-prefix", "all-or-nothing"
     );
-    for &m in &[CacheModel::LongestPrefix, CacheModel::AllOrNothing] {
-        let _ = m;
-    }
-    for pol in &pols {
-        let mut cells = Vec::new();
-        for &m in &[CacheModel::LongestPrefix, CacheModel::AllOrNothing] {
-            let o = CostOpts {
-                model: m,
-                scale: 1.0,
-            };
-            let base = billed_cost_with(&sessions, None, &o);
-            let c = billed_cost_with(&sessions, Some(*pol), &o);
-            cells.push((1.0 - c / base) * 100.0);
-        }
-        println!("{:<20}{:>15.1}%{:>15.1}%", pol.label(), cells[0], cells[1]);
+    for &(p, lp, aon) in &cost_model {
+        println!("{:<20}{:>15.1}%{:>15.1}%", p.label(), lp, aon);
     }
 
     println!("\n2. ESTIMATOR. Per-block sizes are character estimates. Does the sign");
     println!("   survive scaling every visible block by 2x and 3x?\n");
     println!("{:<20}{:>10}{:>10}{:>10}", "policy", "1x", "2x", "3x");
-    for pol in &pols {
-        let mut cells = Vec::new();
-        for sc in [1.0, 2.0, 3.0] {
-            let o = CostOpts {
-                model: CacheModel::LongestPrefix,
-                scale: sc,
-            };
-            let base = billed_cost_with(&sessions, None, &o);
-            let c = billed_cost_with(&sessions, Some(*pol), &o);
-            cells.push((1.0 - c / base) * 100.0);
-        }
-        println!(
-            "{:<20}{:>9.1}%{:>9.1}%{:>9.1}%",
-            pol.label(),
-            cells[0],
-            cells[1],
-            cells[2]
-        );
+    for &(p, [x1, x2, x3]) in &estimator {
+        println!("{:<20}{:>9.1}%{:>9.1}%{:>9.1}%", p.label(), x1, x2, x3);
     }
 
     println!("\n3. UNCERTAINTY. Probes inside one session share a trajectory, so they");
@@ -791,20 +957,14 @@ fn cmd_robustness(all: &[Session], family: &[u32], max_df: usize, min_gap: usize
         "{:<20}{:>10}{:>22}{:>10}",
         "policy", "retained", "95% CI (clustered)", "sessions"
     );
-    for pol in &pols {
-        let per = retention_by_session(&sessions, &probes, *pol);
-        let (kept, total) = retention(&sessions, &probes, *pol);
-        if total == 0 {
-            continue;
-        }
-        let (lo, hi) = bootstrap_ci(&per, 2000);
+    for &(p, r, lo, hi, s) in &uncertainty {
         println!(
             "{:<20}{:>9.1}%{:>14.1}% - {:>4.1}%{:>10}",
-            pol.label(),
-            kept as f64 / total as f64 * 100.0,
-            lo * 100.0,
-            hi * 100.0,
-            per.len()
+            p.label(),
+            r,
+            lo,
+            hi,
+            s
         );
     }
     println!("\nnot tested here: whether a lost fact changes the outcome, and whether");
@@ -833,11 +993,13 @@ fn main() {
             cmd_floor(&sessions, json);
             0
         }
-        Cmd::Probes { max_df, min_gap } => cmd_probes(&sessions, &it.family, max_df, min_gap),
-        Cmd::Sensitivity => cmd_sensitivity(&sessions, &it.family),
-        Cmd::Tradeoff { max_df, min_gap } => cmd_tradeoff(&sessions, &it.family, max_df, min_gap),
+        Cmd::Probes { max_df, min_gap } => cmd_probes(&sessions, &it.family, max_df, min_gap, json),
+        Cmd::Sensitivity => cmd_sensitivity(&sessions, &it.family, json),
+        Cmd::Tradeoff { max_df, min_gap } => {
+            cmd_tradeoff(&sessions, &it.family, max_df, min_gap, json)
+        }
         Cmd::Robustness { max_df, min_gap } => {
-            cmd_robustness(&sessions, &it.family, max_df, min_gap)
+            cmd_robustness(&sessions, &it.family, max_df, min_gap, json)
         }
         Cmd::Counterfactual {
             keep_last,
