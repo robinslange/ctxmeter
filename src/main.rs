@@ -1,9 +1,7 @@
 macro_rules! say {
-    ($out:expr) => {
-        let _ = std::io::Write::write_all(&mut *$out, b"\n");
-    };
     ($out:expr, $($arg:tt)*) => {
-        let _ = std::io::Write::write_fmt(&mut *$out, format_args!("{}\n", format_args!($($arg)*)));
+        std::io::Write::write_fmt(&mut *$out, format_args!("{}\n", format_args!($($arg)*)))
+            .expect("failed printing to output stream")
     };
 }
 
@@ -1186,4 +1184,46 @@ fn main() {
         ),
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `verdict_doc` renames every field of `Verdict` for the JSON shape; a typo
+    /// swapping two of them would compile and pass every existing test, since none
+    /// of them call this function. Distinct values per field catch a swap that a
+    /// repeated value like 0 or 1 would hide.
+    #[test]
+    fn verdict_doc_maps_every_field_to_its_spec_name() {
+        let v = counterfactual::Verdict {
+            turns_attempted: 1,
+            turns_informative: 2,
+            sessions: 3,
+            informative: 4,
+            discarded: 5,
+            unusable_control: 6,
+            unusable_treatment: 7,
+            reproduced: 8,
+            regenerated: 9,
+            sought: 10,
+            silent: 11,
+            errors: vec!["boom".to_string()],
+            measured_tokens: 12,
+        };
+        let doc = verdict_doc(&v);
+        assert_eq!(doc["turns_replayed"], 1);
+        assert_eq!(doc["turns_yielding"], 2);
+        assert_eq!(doc["sessions"], 3);
+        assert_eq!(doc["facts"]["discarded_control"], 5);
+        assert_eq!(doc["facts"]["unusable_control"], 6);
+        assert_eq!(doc["facts"]["unusable_treatment"], 7);
+        assert_eq!(doc["facts"]["informative"], 4);
+        assert_eq!(doc["verdicts"]["reproduced"], 8);
+        assert_eq!(doc["verdicts"]["rewrote"], 9);
+        assert_eq!(doc["verdicts"]["fetched"], 10);
+        assert_eq!(doc["verdicts"]["neither"], 11);
+        assert_eq!(doc["measured_tokens"], 12);
+        assert_eq!(doc["errors"][0], "boom");
+    }
 }
