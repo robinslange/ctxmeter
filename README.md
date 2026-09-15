@@ -67,6 +67,11 @@ the savings a compaction tool is selling you have largely been collected.
 
 Everything except `counterfactual` is offline and free.
 
+Every command takes `--json` and prints one JSON document instead of the report.
+Percentages are percent numbers at full precision, and policies are keyed by name
+in the order the report lists them. `counterfactual` sends its narrative and
+`--show-raw` output to stderr, so the document can be redirected on its own.
+
 **If you are reading someone else's measurements, run `robustness` first.** It
 attacks the tool's own output three ways: swap the cache model, scale the token
 estimator, and replace point estimates with confidence intervals clustered by
