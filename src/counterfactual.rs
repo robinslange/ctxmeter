@@ -898,16 +898,18 @@ pub struct Verdict {
     pub measured_tokens: u64,
 }
 
-fn show(label: &str, resp: &serde_json::Value) {
-    println!("\n--- {label} ---");
-    println!(
+fn show(label: &str, resp: &serde_json::Value, out: &mut dyn std::io::Write) {
+    say!(out, "\n--- {label} ---");
+    say!(
+        out,
         "stop_reason {:?}   usage {}",
         resp.get("stop_reason")
             .and_then(|v| v.as_str())
             .unwrap_or("?"),
         resp.get("usage").map(|u| u.to_string()).unwrap_or_default()
     );
-    println!(
+    say!(
+        out,
         "{}",
         serde_json::to_string_pretty(resp.get("content").unwrap_or(resp)).unwrap_or_default()
     );
@@ -934,7 +936,7 @@ pub fn preflight(cases: &[Case], api_key: &str) -> (Vec<(u64, u64)>, Vec<String>
     (sizes, errs)
 }
 
-pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
+pub fn run(cases: &[Case], api_key: &str, show_raw: bool, out: &mut dyn std::io::Write) -> Verdict {
     let mut v = Verdict {
         turns_attempted: 0,
         turns_informative: 0,
@@ -961,12 +963,16 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
         .zip(&sizes)
         .map(|(c, (a, b))| arm_cost(&c.model, *a, *b))
         .sum();
-    println!(
+    say!(
+        out,
         "\nmeasured {} input tokens across both arms of {} cases: at most ${ceiling:.2},",
         v.measured_tokens,
         cases.len()
     );
-    println!("and less for every case whose control arm fails and never buys a second.");
+    say!(
+        out,
+        "and less for every case whose control arm fails and never buys a second."
+    );
 
     // Sessions with at least one informative fact, not sessions with a case: the
     // interval this bootstraps over must not overstate its independent units,
@@ -975,7 +981,8 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
 
     for (i, c) in cases.iter().enumerate() {
         if show_raw {
-            println!(
+            say!(
+                out,
                 "\nturn {i}: session {}, cut {}, {} / {} tokens, {} fact(s)",
                 c.session,
                 c.cut,
@@ -984,8 +991,8 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
                 c.facts.len()
             );
             for f in &c.facts {
-                println!("  fact ({} chars): {:?}", f.text.len(), f.text);
-                println!("    seeking it means naming {:?}", f.origin);
+                say!(out, "  fact ({} chars): {:?}", f.text.len(), f.text);
+                say!(out, "    seeking it means naming {:?}", f.origin);
             }
         }
         // Control first. A fact the intact context does not reproduce cannot tell
@@ -1003,12 +1010,12 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
         for f in &c.facts {
             let g = grade(&ctrl, f);
             if show_raw {
-                println!("  control graded {g:?} for {:?}", f.text);
+                say!(out, "  control graded {g:?} for {:?}", f.text);
             }
             if let Some(why) = unusable(&ctrl, g) {
                 // A probe token can carry a credential or a client path, so it is
                 // named only under --show-raw, which the line above already did.
-                println!("turn {i} control arm unusable for one fact: {why}");
+                say!(out, "turn {i} control arm unusable for one fact: {why}");
                 v.unusable_control += 1;
                 continue;
             }
@@ -1019,7 +1026,7 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
             live.push(f);
         }
         if show_raw {
-            show("control (context intact)", &ctrl);
+            show("control (context intact)", &ctrl, out);
         }
         if live.is_empty() {
             continue;
@@ -1035,16 +1042,16 @@ pub fn run(cases: &[Case], api_key: &str, show_raw: bool) -> Verdict {
             }
         };
         if show_raw {
-            show("treatment (fact removed)", &treat);
+            show("treatment (fact removed)", &treat, out);
         }
         let before = v.informative;
         for f in live {
             let g = grade(&treat, f);
             if show_raw {
-                println!("  treatment graded {g:?} for {:?}", f.text);
+                say!(out, "  treatment graded {g:?} for {:?}", f.text);
             }
             if let Some(why) = unusable(&treat, g) {
-                println!("turn {i} treatment arm unusable for one fact: {why}");
+                say!(out, "turn {i} treatment arm unusable for one fact: {why}");
                 v.unusable_treatment += 1;
                 continue;
             }

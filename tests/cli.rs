@@ -268,3 +268,88 @@ fn retention_and_cost_agree_across_commands() {
         close(&robustness["cost_model"][p]["longest_prefix"], saved, 1e-9);
     }
 }
+
+#[test]
+fn counterfactual_json_reports_selection_when_nothing_is_usable() {
+    let (c, out, err) = ctxmeter(&[
+        "counterfactual",
+        "--root",
+        CORPUS,
+        "--dry-run",
+        "--sample",
+        "2",
+        "--json",
+    ]);
+    assert_eq!(c, 1);
+    assert!(err.contains("No usable turns."), "{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("one document");
+    assert_eq!(v["mode"], "none");
+    assert_eq!(v["policy"], "keep_last_3");
+    assert_eq!(v["model"], "sonnet");
+    assert_eq!(v["skip"], 0);
+    assert_eq!(v["selection"]["other_model"], 0);
+    assert_eq!(v["selection"]["turns_considered"], 1);
+    assert_eq!(v["selection"]["facts_considered"], 1);
+    assert_eq!(v["selection"]["policy_kept_the_fact"], 1);
+    assert_eq!(v["selection"]["turns_built"], 0);
+}
+
+#[test]
+fn counterfactual_dry_run_json() {
+    let v = json(
+        &[
+            "counterfactual",
+            "--root",
+            CORPUS,
+            "--dry-run",
+            "--sample",
+            "2",
+            "--keep-last",
+            "1",
+            "--json",
+        ],
+        0,
+    );
+    assert_eq!(v["mode"], "dry_run");
+    assert_eq!(v["policy"], "keep_last_1");
+    assert_eq!(v["selection"]["turns_built"], 1);
+    assert_eq!(v["estimate"]["input_tokens"], 859);
+    close(&v["estimate"]["ceiling_usd"], 0.17, 0.005);
+    assert_eq!(v["dry_run"]["invalid_arms"], 0);
+    assert_eq!(v["dry_run"]["turns"], 1);
+    assert_eq!(v["dry_run"]["sessions"], 1);
+    assert_eq!(v["dry_run"]["facts"], 1);
+}
+
+#[test]
+fn counterfactual_dry_run_narrative_moves_to_stderr_in_json_mode() {
+    let (_, _, err) = ctxmeter(&[
+        "counterfactual",
+        "--root",
+        CORPUS,
+        "--dry-run",
+        "--sample",
+        "2",
+        "--keep-last",
+        "1",
+        "--json",
+    ]);
+    assert_eq!(err, golden("counterfactual-dry-run"));
+}
+
+#[test]
+fn a_refusal_prints_no_document() {
+    let (c, out, err) = ctxmeter(&[
+        "counterfactual",
+        "--root",
+        CORPUS,
+        "--sample",
+        "2",
+        "--keep-last",
+        "1",
+        "--json",
+    ]);
+    assert_eq!(c, 2);
+    assert_eq!(out, "");
+    assert!(err.contains("ANTHROPIC_API_KEY is not set"), "{err}");
+}

@@ -1,3 +1,12 @@
+macro_rules! say {
+    ($out:expr) => {
+        let _ = std::io::Write::write_all(&mut *$out, b"\n");
+    };
+    ($out:expr, $($arg:tt)*) => {
+        let _ = std::io::Write::write_fmt(&mut *$out, format_args!("{}\n", format_args!($($arg)*)));
+    };
+}
+
 mod counterfactual;
 mod probes;
 mod transcript;
@@ -545,27 +554,70 @@ struct CfArgs {
     show_raw: bool,
     max_df: usize,
     min_gap: usize,
+    json: bool,
 }
 
 /// What the selection lost, and where each denominator comes from. `other model`
 /// is counted over the whole corpus before any turn is visited, so it is not a
 /// component of `facts considered` and is not printed as one.
-fn print_drops(d: &counterfactual::Dropped, skip: usize, built: usize) {
-    println!(
+fn print_drops(
+    out: &mut dyn std::io::Write,
+    d: &counterfactual::Dropped,
+    skip: usize,
+    built: usize,
+) {
+    say!(
+        out,
         "facts on another model, corpus-wide: {} (excluded before selection)",
         d.other_model
     );
-    println!("turns skipped     : {skip} (built, then passed over; not counted below)");
-    println!("turns considered  : {}", d.turns_considered);
-    println!("  unrebuildable   : {}", d.unrebuildable);
-    println!("facts considered  : {}", d.considered);
-    println!("  policy kept it  : {}", d.policy_kept_the_fact);
-    println!("  no re-fetch tgt : {}", d.no_refetch_target);
-    println!("  fact is origin  : {}", d.fact_is_its_origin);
-    println!("turns built       : {built}");
+    say!(
+        out,
+        "turns skipped     : {skip} (built, then passed over; not counted below)"
+    );
+    say!(out, "turns considered  : {}", d.turns_considered);
+    say!(out, "  unrebuildable   : {}", d.unrebuildable);
+    say!(out, "facts considered  : {}", d.considered);
+    say!(out, "  policy kept it  : {}", d.policy_kept_the_fact);
+    say!(out, "  no re-fetch tgt : {}", d.no_refetch_target);
+    say!(out, "  fact is origin  : {}", d.fact_is_its_origin);
+    say!(out, "turns built       : {built}");
+}
+
+fn done(json: bool, doc: serde_json::Value, code: i32) -> i32 {
+    if json {
+        emit(doc);
+    }
+    code
+}
+
+fn verdict_doc(v: &counterfactual::Verdict) -> serde_json::Value {
+    serde_json::json!({
+        "turns_replayed": v.turns_attempted,
+        "turns_yielding": v.turns_informative,
+        "sessions": v.sessions,
+        "facts": {
+            "discarded_control": v.discarded,
+            "unusable_control": v.unusable_control,
+            "unusable_treatment": v.unusable_treatment,
+            "informative": v.informative,
+        },
+        "verdicts": {
+            "reproduced": v.reproduced,
+            "rewrote": v.regenerated,
+            "fetched": v.sought,
+            "neither": v.silent,
+        },
+        "measured_tokens": v.measured_tokens,
+        "errors": v.errors,
+    })
 }
 
 fn cmd_counterfactual(all: &[Session], names: &[String], family: &[u32], a: CfArgs) -> i32 {
+    let mut stdout = std::io::stdout();
+    let mut stderr = std::io::stderr();
+    let out: &mut dyn std::io::Write = if a.json { &mut stderr } else { &mut stdout };
+
     let sessions = eligible(all);
     let probes = harvest(&sessions, family, a.max_df, a.min_gap);
     let paths: Vec<String> = sessions.iter().map(|s| s.path.clone()).collect();
@@ -579,10 +631,26 @@ fn cmd_counterfactual(all: &[Session], names: &[String], family: &[u32], a: CfAr
         interned: names,
     };
     let cases = counterfactual::build_cases(&corpus, pol, a.sample, a.skip, &a.model, &mut dropped);
+    let mut doc = serde_json::json!({
+        "policy": pol.label(),
+        "model": a.model,
+        "skip": a.skip,
+        "mode": "none",
+        "selection": {
+            "other_model": dropped.other_model,
+            "turns_considered": dropped.turns_considered,
+            "unrebuildable": dropped.unrebuildable,
+            "facts_considered": dropped.considered,
+            "policy_kept_the_fact": dropped.policy_kept_the_fact,
+            "no_refetch_target": dropped.no_refetch_target,
+            "fact_is_its_origin": dropped.fact_is_its_origin,
+            "turns_built": cases.len(),
+        },
+    });
     if cases.is_empty() {
-        println!("No usable turns.");
-        print_drops(&dropped, a.skip, cases.len());
-        return 1;
+        say!(out, "No usable turns.");
+        print_drops(out, &dropped, a.skip, cases.len());
+        return done(a.json, doc, 1);
     }
 
     let mut models: Vec<&str> = cases.iter().map(|c| c.model.as_str()).collect();
@@ -602,34 +670,62 @@ fn cmd_counterfactual(all: &[Session], names: &[String], family: &[u32], a: CfAr
     let toks: u64 = cases
         .iter()
         .map(|c| {
-            let (a, b) = counterfactual::estimate_tokens(c);
-            a + b
+            let (ta, tb) = counterfactual::estimate_tokens(c);
+            ta + tb
         })
         .sum();
-    println!("policy under test: {}", pol.label());
-    println!("model family    : {}", a.model);
-    print_drops(&dropped, a.skip, cases.len());
-    println!("input tokens     : {toks} across both arms");
-    println!("spend ceiling    : ${cost:.2}  (published prices, checked 2026-09-14)");
-    println!("\na ceiling, not an estimate, and it reads high: it bounds output at the");
-    println!("ceiling for two arms per turn where a real turn produces a fraction of it,");
-    println!("and it buys both arms of every turn where a turn whose control arm fails");
-    println!("never buys its second. Against that, it takes input from serialized length");
-    println!("over 4, which undercounts. The run prints the measured count beside it.");
-    println!("\neach turn is at most two calls: the intact context as control, then the");
-    println!("policy applied. a fact only counts if the control arm reproduces it.");
+    doc["estimate"] = serde_json::json!({ "input_tokens": toks, "ceiling_usd": cost });
+    say!(out, "policy under test: {}", pol.label());
+    say!(out, "model family    : {}", a.model);
+    print_drops(out, &dropped, a.skip, cases.len());
+    say!(out, "input tokens     : {toks} across both arms");
+    say!(
+        out,
+        "spend ceiling    : ${cost:.2}  (published prices, checked 2026-09-14)"
+    );
+    say!(
+        out,
+        "\na ceiling, not an estimate, and it reads high: it bounds output at the"
+    );
+    say!(
+        out,
+        "ceiling for two arms per turn where a real turn produces a fraction of it,"
+    );
+    say!(
+        out,
+        "and it buys both arms of every turn where a turn whose control arm fails"
+    );
+    say!(
+        out,
+        "never buys its second. Against that, it takes input from serialized length"
+    );
+    say!(
+        out,
+        "over 4, which undercounts. The run prints the measured count beside it."
+    );
+    say!(
+        out,
+        "\neach turn is at most two calls: the intact context as control, then the"
+    );
+    say!(
+        out,
+        "policy applied. a fact only counts if the control arm reproduces it."
+    );
 
     if a.dry_run {
-        let mut models: Vec<(String, usize)> = Vec::new();
+        let mut called: Vec<(String, usize)> = Vec::new();
         for c in &cases {
-            match models.iter_mut().find(|(m, _)| *m == c.model) {
+            match called.iter_mut().find(|(m, _)| *m == c.model) {
                 Some(e) => e.1 += 1,
-                None => models.push((c.model.clone(), 1)),
+                None => called.push((c.model.clone(), 1)),
             }
         }
-        println!("\nmodels to be called (the one that produced each trace):");
-        for (m, n) in models {
-            println!("  {m}  {n}");
+        say!(
+            out,
+            "\nmodels to be called (the one that produced each trace):"
+        );
+        for (m, n) in called {
+            say!(out, "  {m}  {n}");
         }
         let mut bad = 0;
         for (i, c) in cases.iter().enumerate() {
@@ -639,17 +735,24 @@ fn cmd_counterfactual(all: &[Session], names: &[String], family: &[u32], a: CfAr
             ] {
                 if let Some(why) = counterfactual::invalid(msgs) {
                     if bad < 5 {
-                        println!("\ncase {i} {arm} is not a sendable request: {why}");
+                        say!(out, "\ncase {i} {arm} is not a sendable request: {why}");
                     }
                     bad += 1;
                 }
             }
         }
         if bad > 0 {
-            println!("\n{bad} arm(s) would be rejected by the API. Counting them all rather");
-            println!("than stopping at the first: one is a bug, and the rate is the news.");
+            say!(
+                out,
+                "\n{bad} arm(s) would be rejected by the API. Counting them all rather"
+            );
+            say!(
+                out,
+                "than stopping at the first: one is a bug, and the rate is the news."
+            );
         } else {
-            println!(
+            say!(
+                out,
                 "\nall {} cases satisfy the request invariants.",
                 cases.len()
             );
@@ -657,21 +760,30 @@ fn cmd_counterfactual(all: &[Session], names: &[String], family: &[u32], a: CfAr
         let mut sess: Vec<usize> = cases.iter().map(|c| c.session).collect();
         sess.sort_unstable();
         sess.dedup();
-        println!("{} turns across {} sessions.", cases.len(), sess.len());
-        let (a, b) = counterfactual::estimate_tokens(&cases[0]);
+        say!(out, "{} turns across {} sessions.", cases.len(), sess.len());
+        let (ta, tb) = counterfactual::estimate_tokens(&cases[0]);
         let facts: usize = cases.iter().map(|c| c.facts.len()).sum();
-        println!(
+        say!(
+            out,
             "\n{facts} facts over {} turns, {:.2} per turn",
             cases.len(),
             facts as f64 / cases.len() as f64
         );
-        println!(
-            "first turn: {} messages intact ({a} tok), masked ({b} tok), {} fact(s)",
+        say!(
+            out,
+            "first turn: {} messages intact ({ta} tok), masked ({tb} tok), {} fact(s)",
             cases[0].messages_intact.len(),
             cases[0].facts.len()
         );
-        println!("\ndry run: nothing was sent.");
-        return i32::from(bad > 0);
+        say!(out, "\ndry run: nothing was sent.");
+        doc["mode"] = "dry_run".into();
+        doc["dry_run"] = serde_json::json!({
+            "invalid_arms": bad,
+            "turns": cases.len(),
+            "sessions": sess.len(),
+            "facts": facts,
+        });
+        return done(a.json, doc, i32::from(bad > 0));
     }
 
     let key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
@@ -685,13 +797,16 @@ fn cmd_counterfactual(all: &[Session], names: &[String], family: &[u32], a: CfAr
     if a.preflight {
         let (sizes, errs) = counterfactual::preflight(&cases, &key);
         let measured: u64 = sizes.iter().map(|(x, y)| x + y).sum();
-        println!(
+        say!(
+            out,
             "\nmeasured {measured} input tokens across both arms of {} turns",
             cases.len()
         );
+        doc["mode"] = "preflight".into();
+        doc["preflight"] = serde_json::json!({ "measured_tokens": measured, "rejected": errs });
         if errs.is_empty() {
-            println!("every arm was accepted. nothing was spent.");
-            return 0;
+            say!(out, "every arm was accepted. nothing was spent.");
+            return done(a.json, doc, 0);
         }
         eprintln!(
             "\n{} of {} arms would be rejected:",
@@ -702,14 +817,16 @@ fn cmd_counterfactual(all: &[Session], names: &[String], family: &[u32], a: CfAr
             eprintln!("  {e}");
         }
         eprintln!("\nnothing was spent. these are bugs in the rebuild, not results.");
-        return 3;
+        return done(a.json, doc, 3);
     }
     if !a.yes {
         eprintln!("\nRefusing to spend ${cost:.2} without --yes.");
         return 2;
     }
 
-    let v = counterfactual::run(&cases, &key, a.show_raw);
+    let v = counterfactual::run(&cases, &key, a.show_raw, out);
+    doc["mode"] = "run".into();
+    doc["result"] = verdict_doc(&v);
     let attempted = v.turns_attempted;
     if !v.errors.is_empty() {
         eprintln!("\nThe run stopped: the API did not accept a request.");
@@ -718,71 +835,108 @@ fn cmd_counterfactual(all: &[Session], names: &[String], family: &[u32], a: CfAr
         }
         eprintln!("\nThis is a bug in the rebuild, not a result about the policy.");
         if attempted == 0 {
-            return 3;
+            return done(a.json, doc, 3);
         }
         eprintln!("{attempted} turn(s) completed before it, reported below.");
     }
-    println!("\n{:<30}{:>8}", "turns replayed", v.turns_attempted);
-    println!("{:<30}{:>8}", "turns yielding a fact", v.turns_informative);
-    println!("{:<30}{:>8}", "sessions", v.sessions);
-    println!("{:<30}{:>8}", "facts discarded (control)", v.discarded);
-    println!(
+    say!(out, "\n{:<30}{:>8}", "turns replayed", v.turns_attempted);
+    say!(
+        out,
         "{:<30}{:>8}",
-        "facts unusable, control arm", v.unusable_control
+        "turns yielding a fact",
+        v.turns_informative
     );
-    println!(
+    say!(out, "{:<30}{:>8}", "sessions", v.sessions);
+    say!(out, "{:<30}{:>8}", "facts discarded (control)", v.discarded);
+    say!(
+        out,
         "{:<30}{:>8}",
-        "facts unusable, treatment arm", v.unusable_treatment
+        "facts unusable, control arm",
+        v.unusable_control
     );
-    println!("{:<30}{:>8}", "facts informative", v.informative);
+    say!(
+        out,
+        "{:<30}{:>8}",
+        "facts unusable, treatment arm",
+        v.unusable_treatment
+    );
+    say!(out, "{:<30}{:>8}", "facts informative", v.informative);
     if v.measured_tokens > 0 {
-        println!(
+        say!(
+            out,
             "\ninput tokens: {} measured by count_tokens, {toks} estimated",
             v.measured_tokens
         );
     }
     if v.informative == 0 {
-        println!("\nNo informative cases. Nothing can be concluded.");
-        return 1;
+        say!(out, "\nNo informative cases. Nothing can be concluded.");
+        return done(a.json, doc, 1);
     }
     if !v.errors.is_empty() {
-        println!("\nThe sample below is what completed, not what was asked for.");
+        say!(
+            out,
+            "\nThe sample below is what completed, not what was asked for."
+        );
     }
     let p = |n: usize| format!("{:.1}%", n as f64 / v.informative as f64 * 100.0);
-    println!("\nof the informative cases, with the fact removed the model:");
-    println!(
+    say!(
+        out,
+        "\nof the informative cases, with the fact removed the model:"
+    );
+    say!(
+        out,
         "  {:<24}{:>8}{:>9}",
         "reproduced it anyway",
         v.reproduced,
         p(v.reproduced)
     );
-    println!(
+    say!(
+        out,
         "  {:<24}{:>8}{:>9}",
         "rewrote it into prose",
         v.regenerated,
         p(v.regenerated)
     );
-    println!(
+    say!(
+        out,
         "  {:<24}{:>8}{:>9}",
         "went to fetch it",
         v.sought,
         p(v.sought)
     );
-    println!("  {:<24}{:>8}{:>9}", "did neither", v.silent, p(v.silent));
-    println!("\n'did neither' is the irreversible share: the fact was gone and the model");
-    println!("did not ask for it back. 'went to fetch it' is the healthy failure.");
-    println!(
-        "\n{} facts over {} turns in {} sessions. facts sharing a turn share one",
-        v.informative, v.turns_informative, v.sessions
+    say!(
+        out,
+        "  {:<24}{:>8}{:>9}",
+        "did neither",
+        v.silent,
+        p(v.silent)
     );
-    println!("response, and facts sharing an origin share their 'went to fetch it'");
-    println!("verdict, so an interval bootstraps over sessions and not over facts.");
+    say!(
+        out,
+        "\n'did neither' is the irreversible share: the fact was gone and the model"
+    );
+    say!(
+        out,
+        "did not ask for it back. 'went to fetch it' is the healthy failure."
+    );
+    say!(
+        out,
+        "\n{} facts over {} turns in {} sessions. facts sharing a turn share one",
+        v.informative,
+        v.turns_informative,
+        v.sessions
+    );
+    say!(
+        out,
+        "response, and facts sharing an origin share their 'went to fetch it'"
+    );
+    say!(
+        out,
+        "verdict, so an interval bootstraps over sessions and not over facts."
+    );
     // A run that stopped early still reports what it bought, but it did not succeed.
-    if v.errors.is_empty() {
-        0
-    } else {
-        3
-    }
+    let code = if v.errors.is_empty() { 0 } else { 3 };
+    done(a.json, doc, code)
 }
 
 /// A CLI piped into `head` or `less` must exit quietly, not panic on a closed pipe.
@@ -1027,6 +1181,7 @@ fn main() {
                 show_raw,
                 max_df,
                 min_gap,
+                json,
             },
         ),
     };
