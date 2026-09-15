@@ -1,0 +1,10 @@
+No usable turns.
+facts on another model, corpus-wide: 0 (excluded before selection)
+turns skipped     : 0 (built, then passed over; not counted below)
+turns considered  : 1
+  unrebuildable   : 0
+facts considered  : 1
+  policy kept it  : 1
+  no re-fetch tgt : 0
+  fact is origin  : 0
+turns built       : 0

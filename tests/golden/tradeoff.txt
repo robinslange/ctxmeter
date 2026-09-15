@@ -1,0 +1,18 @@
+1 sessions, 1 probes, baseline billed cost 28610 equivalents
+
+policy                cost saved info retained     info lost
+keep_last_1                -0.2%          0.0%        100.0%
+keep_last_3                 0.0%        100.0%          0.0%
+keep_last_5                 0.0%        100.0%          0.0%
+keep_last_10                0.0%        100.0%          0.0%
+keep_last_25                0.0%        100.0%          0.0%
+keep_last_50                0.0%        100.0%          0.0%
+tail_budget_10k             0.0%        100.0%          0.0%
+tail_budget_40k             0.0%        100.0%          0.0%
+tail_budget_100k            0.0%        100.0%          0.0%
+tail_budget_200k            0.0%        100.0%          0.0%
+
+both columns come from the same policy applied the same way.
+cost is grounded in real prefix sizes, so the system prompt and tool
+definitions are carried unchanged: no context policy can touch them.
+retention measures information survival, not task success.

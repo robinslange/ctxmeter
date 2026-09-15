@@ -25,7 +25,8 @@ jobs:
     # Compiling proves nothing about the reader. Run the binary against a
     # synthetic transcript and check it produces the numbers we expect.
     #
-    # tests/corpus is frozen and read by nothing else. The unit fixtures in
+    # tests/corpus is frozen, and read only by this job and the golden-output
+    # tests in tests/cli.rs. The unit fixtures in
     # tests/fixture grow and change as tests need them, and every command here
     # reports over a whole directory, so sharing one would make an exact count
     # break whenever someone added a fixture.

@@ -1,0 +1,26 @@
+sessions scanned 1   yielding probes 1   probes 1
+probes per scanned session 1.00   (token in <= 3 sessions)
+gap from established to needed, in blocks: p50 8  p90 8  max 8
+depth of the reuse, in messages: p50 7  p90 7  max 7
+
+policy                  probes   destroyed   retained      shallow      deep
+keep_last_1                  1           1      0.00%        0.00%       n/a
+keep_last_3                  1           0    100.00%      100.00%       n/a
+keep_last_5                  1           0    100.00%      100.00%       n/a
+keep_last_10                 1           0    100.00%      100.00%       n/a
+keep_last_25                 1           0    100.00%      100.00%       n/a
+keep_last_50                 1           0    100.00%      100.00%       n/a
+tail_budget_10k              1           0    100.00%      100.00%       n/a
+tail_budget_40k              1           0    100.00%      100.00%       n/a
+tail_budget_100k             1           0    100.00%      100.00%       n/a
+tail_budget_200k             1           0    100.00%      100.00%       n/a
+
+shallow = reuse at message 7 or earlier, deep = later. where the two
+columns disagree, one retained figure is averaging two populations. tier two
+replays a turn by cutting at its depth, and a replay agrees with the trace far
+more often when the prefix is short, so the probes it can speak for come from
+the shallow end of this distribution rather than from across it.
+
+retained = the fact was still literally present when the agent needed it.
+this measures information retention, not task success. losing a fact is not
+proof of failure: another valid route may exist.

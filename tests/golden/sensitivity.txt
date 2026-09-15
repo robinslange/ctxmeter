@@ -1,0 +1,7 @@
+ rarity   gap    probes       keep_last_1       keep_last_3       keep_last_5      keep_last_10      keep_last_25      keep_last_50   tail_budget_10k   tail_budget_40k  tail_budget_100k  tail_budget_200k
+      1     5         1              0.0%            100.0%            100.0%            100.0%            100.0%            100.0%            100.0%            100.0%            100.0%            100.0%
+      3     5         1              0.0%            100.0%            100.0%            100.0%            100.0%            100.0%            100.0%            100.0%            100.0%            100.0%
+     10     5         1              0.0%            100.0%            100.0%            100.0%            100.0%            100.0%            100.0%            100.0%            100.0%            100.0%
+
+policy ranking: keep_last_3 > keep_last_5 > keep_last_10 > keep_last_25 > keep_last_50 > tail_budget_10k > tail_budget_40k > tail_budget_100k > tail_budget_200k > keep_last_1
+stable across all 3 conditions. widening the sample does not move the answer.

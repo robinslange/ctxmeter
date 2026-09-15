@@ -1,0 +1,33 @@
+policy under test: keep_last_1
+model family    : sonnet
+facts on another model, corpus-wide: 0 (excluded before selection)
+turns skipped     : 0 (built, then passed over; not counted below)
+turns considered  : 1
+  unrebuildable   : 0
+facts considered  : 1
+  policy kept it  : 0
+  no re-fetch tgt : 0
+  fact is origin  : 0
+turns built       : 1
+input tokens     : 859 across both arms
+spend ceiling    : $0.17  (published prices, checked 2026-09-14)
+
+a ceiling, not an estimate, and it reads high: it bounds output at the
+ceiling for two arms per turn where a real turn produces a fraction of it,
+and it buys both arms of every turn where a turn whose control arm fails
+never buys its second. Against that, it takes input from serialized length
+over 4, which undercounts. The run prints the measured count beside it.
+
+each turn is at most two calls: the intact context as control, then the
+policy applied. a fact only counts if the control arm reproduces it.
+
+models to be called (the one that produced each trace):
+  claude-sonnet-5  1
+
+all 1 cases satisfy the request invariants.
+1 turns across 1 sessions.
+
+1 facts over 1 turns, 1.00 per turn
+first turn: 7 messages intact (476 tok), masked (383 tok), 1 fact(s)
+
+dry run: nothing was sent.

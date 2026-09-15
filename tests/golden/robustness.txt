@@ -1,0 +1,50 @@
+1. COST MODEL. The cost column is a simulation. Does its sign survive
+   replacing generous prefix matching with the all-or-nothing behaviour
+   measured on real traces?
+
+policy                longest-prefix  all-or-nothing
+keep_last_1                    -0.2%           -0.5%
+keep_last_3                     0.0%            0.0%
+keep_last_5                     0.0%            0.0%
+keep_last_10                    0.0%            0.0%
+keep_last_25                    0.0%            0.0%
+keep_last_50                    0.0%            0.0%
+tail_budget_10k                 0.0%            0.0%
+tail_budget_40k                 0.0%            0.0%
+tail_budget_100k                0.0%            0.0%
+tail_budget_200k                0.0%            0.0%
+
+2. ESTIMATOR. Per-block sizes are character estimates. Does the sign
+   survive scaling every visible block by 2x and 3x?
+
+policy                      1x        2x        3x
+keep_last_1              -0.2%     -0.1%     -0.0%
+keep_last_3               0.0%      0.0%      0.0%
+keep_last_5               0.0%      0.0%      0.0%
+keep_last_10              0.0%      0.0%      0.0%
+keep_last_25              0.0%      0.0%      0.0%
+keep_last_50              0.0%      0.0%      0.0%
+tail_budget_10k           0.0%      0.0%      0.0%
+tail_budget_40k           0.0%      0.0%      0.0%
+tail_budget_100k          0.0%      0.0%      0.0%
+tail_budget_200k          0.0%      0.0%      0.0%
+
+3. UNCERTAINTY. Probes inside one session share a trajectory, so they
+   are not independent. 95% interval from a cluster bootstrap over
+   sessions, 2000 resamples.
+
+policy                retained    95% CI (clustered)  sessions
+keep_last_1               0.0%           0.0% -  0.0%         1
+keep_last_3             100.0%         100.0% - 100.0%         1
+keep_last_5             100.0%         100.0% - 100.0%         1
+keep_last_10            100.0%         100.0% - 100.0%         1
+keep_last_25            100.0%         100.0% - 100.0%         1
+keep_last_50            100.0%         100.0% - 100.0%         1
+tail_budget_10k         100.0%         100.0% - 100.0%         1
+tail_budget_40k         100.0%         100.0% - 100.0%         1
+tail_budget_100k        100.0%         100.0% - 100.0%         1
+tail_budget_200k        100.0%         100.0% - 100.0%         1
+
+not tested here: whether a lost fact changes the outcome, and whether
+an implementation that keeps originals retrievable recovers it.
+both of those make this an upper bound on harm, not a measurement of it.

@@ -1,0 +1,11 @@
+first-turn billed prefix, n=1
+  p25:      18012
+  p50:      18012
+  p75:      18012
+  p90:      18012
+
+month       sessions      median         p90
+
+this is re-read every turn and no proxy can compress it.
+attribute it by changing config and re-running: tool definitions
+never appear in a transcript.

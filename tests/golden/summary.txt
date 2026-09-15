@@ -1,0 +1,13 @@
+turns 4   sessions 1
+
+                      tokens     share      billed equiv
+fresh                     24     0.03%                24
+write                  20250    26.38%             25312
+read                   56500    73.59%              5650
+output                   233
+
+cache hit rate      73.59%
+billed equivalents  30986  (no-cache counterfactual 76774)
+caching already saves 59.64%
+
+models: claude-sonnet-5 4

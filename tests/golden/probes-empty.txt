@@ -1,0 +1,4 @@
+sessions scanned 1   yielding probes 0   probes 0
+
+NO PROBES HARVESTED. Loud failure by design: an empty denominator must
+never read as a pass. Relax --max-df or lower --min-gap.
