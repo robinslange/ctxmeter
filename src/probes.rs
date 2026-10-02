@@ -171,41 +171,29 @@ pub fn harvest(
         .collect()
 }
 
+fn tool_results(s: &Session) -> Vec<usize> {
+    s.blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.kind == Kind::ToolResult)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Where a probe stands under a policy when the agent reaches for it: `None` when
+/// no earlier tool result holds it, otherwise whether it survived and the latest
+/// block that held it, which is what fetching it back would return.
+fn reach(s: &Session, tr: &[usize], p: &Probe, pol: Policy) -> Option<(bool, usize)> {
+    let live = &tr[..tr.partition_point(|&i| i < p.use_at)];
+    let last = live.iter().rposition(|&i| has(&s.blocks[i], p.tok))?;
+    Some((last >= pol.survives_from(live, &s.blocks), live[last]))
+}
+
 /// (facts still present when needed, facts tested) under one policy.
 pub fn retention(sessions: &[&Session], probes: &[Vec<Probe>], pol: Policy) -> (u64, u64) {
-    let mut kept = 0u64;
-    let mut total = 0u64;
-    for (s, ps) in sessions.iter().zip(probes) {
-        if ps.is_empty() {
-            continue;
-        }
-        let tr: Vec<usize> = s
-            .blocks
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.kind == Kind::ToolResult)
-            .map(|(i, _)| i)
-            .collect();
-        for p in ps {
-            let cut = tr.partition_point(|&i| i < p.use_at);
-            let live = &tr[..cut];
-            let holders: Vec<usize> = live
-                .iter()
-                .enumerate()
-                .filter(|(_, &i)| has(&s.blocks[i], p.tok))
-                .map(|(pos, _)| pos)
-                .collect();
-            if holders.is_empty() {
-                continue;
-            }
-            total += 1;
-            let from = pol.survives_from(live, &s.blocks);
-            if holders.iter().any(|&pos| pos >= from) {
-                kept += 1;
-            }
-        }
-    }
-    (kept, total)
+    retention_by_session(sessions, probes, pol)
+        .into_iter()
+        .fold((0, 0), |(k, t), (a, b)| (k + a, t + b))
 }
 
 /// A masked tool result still costs its call header and a placeholder.
@@ -248,13 +236,7 @@ pub fn billed_cost(sessions: &[&Session], pol: Option<Policy>) -> f64 {
 pub fn billed_cost_with(sessions: &[&Session], pol: Option<Policy>, o: &CostOpts) -> f64 {
     let mut cost = 0.0;
     for s in sessions {
-        let tr: Vec<usize> = s
-            .blocks
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.kind == Kind::ToolResult)
-            .map(|(i, _)| i)
-            .collect();
+        let tr = tool_results(s);
         let mut prev: Vec<(usize, u64)> = Vec::new();
         for &(cut, real) in &s.turns {
             let cut = cut.min(s.blocks.len());
@@ -327,41 +309,50 @@ pub fn retention_by_session(
 ) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     for (s, ps) in sessions.iter().zip(probes) {
-        if ps.is_empty() {
-            continue;
-        }
-        let tr: Vec<usize> = s
-            .blocks
+        let tr = tool_results(s);
+        let (kept, total) = ps
             .iter()
-            .enumerate()
-            .filter(|(_, b)| b.kind == Kind::ToolResult)
-            .map(|(i, _)| i)
-            .collect();
-        let mut kept = 0u64;
-        let mut total = 0u64;
-        for p in ps {
-            let cut = tr.partition_point(|&i| i < p.use_at);
-            let live = &tr[..cut];
-            let holders: Vec<usize> = live
-                .iter()
-                .enumerate()
-                .filter(|(_, &i)| has(&s.blocks[i], p.tok))
-                .map(|(pos, _)| pos)
-                .collect();
-            if holders.is_empty() {
-                continue;
-            }
-            total += 1;
-            let from = pol.survives_from(live, &s.blocks);
-            if holders.iter().any(|&pos| pos >= from) {
-                kept += 1;
-            }
-        }
+            .filter_map(|p| reach(s, &tr, p, pol))
+            .fold((0u64, 0u64), |(k, t), (survived, _)| {
+                (k + survived as u64, t + 1)
+            });
         if total > 0 {
             out.push((kept, total));
         }
     }
     out
+}
+
+/// What fetching back every fact the policy destroyed, and the agent later reused,
+/// would add to the bill: one extra request, which reads the masked prefix from
+/// cache and writes the result again. A result comes back once per session, with
+/// every fact it held.
+pub fn refetch_cost(sessions: &[&Session], probes: &[Vec<Probe>], pol: Policy) -> f64 {
+    let mut cost = 0.0;
+    for (s, ps) in sessions.iter().zip(probes) {
+        let tr = tool_results(s);
+        let mut fetched = std::collections::HashSet::new();
+        for p in ps {
+            let Some((false, block)) = reach(s, &tr, p, pol) else {
+                continue;
+            };
+            if !fetched.insert(block) {
+                continue;
+            }
+            let at = s.turns.partition_point(|&(cut, _)| cut <= p.use_at);
+            let &(cut, real) = s.turns[..at].last().unwrap_or(&(0, 0));
+            let cut = cut.min(s.blocks.len());
+            let raw: u64 = s.blocks[..cut].iter().map(|b| b.tokens as u64).sum();
+            let live = &tr[..tr.partition_point(|&i| i < cut)];
+            let reclaimed: u64 = live[..pol.survives_from(live, &s.blocks)]
+                .iter()
+                .map(|&i| s.blocks[i].tokens.saturating_sub(PLACEHOLDER) as u64)
+                .sum();
+            let prefix = real.max(raw).saturating_sub(reclaimed);
+            cost += R * prefix as f64 + W * s.blocks[block].tokens as f64;
+        }
+    }
+    cost
 }
 
 /// Cluster bootstrap: resample whole sessions, not individual probes.
@@ -430,6 +421,39 @@ mod tests {
         }
         blocks.push(block(6, Role::Assistant, Kind::ToolUse, vec![tok]));
         session(blocks)
+    }
+
+    /// A 1,000-token result masked by keep_last_1 and needed again costs one more
+    /// request over the masked prefix, plus writing the result back. Two facts from
+    /// that result come back in one fetch, and a policy that kept it pays nothing.
+    #[test]
+    fn a_refetch_pays_for_the_prefix_once_per_result() {
+        let mut blocks = vec![block(0, Role::User, Kind::ToolResult, vec![1, 2])];
+        blocks[0].tokens = 1000;
+        for i in 1..6 {
+            blocks.push(block(i, Role::Assistant, Kind::Text, vec![]));
+        }
+        blocks.push(block(6, Role::User, Kind::ToolResult, vec![]));
+        blocks.push(block(7, Role::Assistant, Kind::ToolUse, vec![1, 2]));
+        let mut s = session(blocks);
+        s.turns = vec![(7, 5000)];
+        let sessions = vec![&s];
+        let probes = vec![vec![
+            Probe {
+                tok: 1,
+                origin: 0,
+                use_at: 7,
+            },
+            Probe {
+                tok: 2,
+                origin: 0,
+                use_at: 7,
+            },
+        ]];
+
+        let want = R * 4025.0 + W * 1000.0;
+        assert_eq!(refetch_cost(&sessions, &probes, Policy::KeepLast(1)), want);
+        assert_eq!(refetch_cost(&sessions, &probes, Policy::KeepLast(3)), 0.0);
     }
 
     /// `/tmp/t3.txt` passes the length, digit and letter floors, and each literal

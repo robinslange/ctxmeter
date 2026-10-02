@@ -207,6 +207,16 @@ fn tradeoff_json() {
     assert_eq!(keys(&v["policies"]), POLICIES);
     let k1 = &v["policies"]["keep_last_1"];
     close(&k1["cost_saved"], -0.2, 0.05);
+    let refetched = k1["cost_saved_if_refetched"].as_f64().expect("a number");
+    assert!(
+        refetched < -0.2,
+        "re-fetching a lost fact came out free: {refetched}"
+    );
+    close(
+        &v["policies"]["keep_last_3"]["cost_saved_if_refetched"],
+        v["policies"]["keep_last_3"]["cost_saved"].as_f64().unwrap(),
+        1e-9,
+    );
     close(&k1["retained"], 0.0, 1e-9);
     close(&k1["lost"], 100.0, 1e-9);
     assert_eq!(k1["kind"], "keep_last");

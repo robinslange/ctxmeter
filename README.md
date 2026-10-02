@@ -60,7 +60,7 @@ the savings a compaction tool is selling you have largely been collected.
 | `summary` | What am I paying for, and how much has caching already saved? |
 | `floor` | How big is my system prompt plus tool definitions, and is it growing? |
 | `probes` | How much later-needed information does each retention policy destroy? |
-| `tradeoff` | What does each policy save, set against what it destroys? |
+| `tradeoff` | What does each policy save, set against what it destroys and what fetching it back costs? |
 | `sensitivity` | Does the policy ranking survive widening the sample? |
 | `robustness` | Does any of this survive its own assumptions? |
 | `counterfactual` | When a fact is destroyed, does the agent actually change course? |
@@ -104,6 +104,12 @@ from logs. Change one config item, start a fresh session, and re-run.
 when the agent reached for them. A probe is a distinctive identifier that a tool
 result established, and that the agent demonstrably reused much later. Retention
 measures information survival, not task success.
+
+**Re-fetch.** `tradeoff` also prices the healthy failure. Each fact a policy
+destroyed and the agent later reused is charged one extra request: the masked
+prefix read back from cache, and the result that held it written again, once per
+result per session. It only sees facts a probe can see, and it assumes every one
+is fetched back; `counterfactual` measures how often one actually is.
 
 ## Tier two: did losing it matter?
 

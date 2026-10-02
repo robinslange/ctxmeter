@@ -11,8 +11,8 @@ mod transcript;
 
 use clap::{Parser, Subcommand};
 use probes::{
-    billed_cost, billed_cost_with, bootstrap_ci, default_policies, eligible, harvest, retention,
-    retention_by_session, CacheModel, CostOpts, Policy,
+    billed_cost, billed_cost_with, bootstrap_ci, default_policies, eligible, harvest, refetch_cost,
+    retention, retention_by_session, CacheModel, CostOpts, Policy,
 };
 use std::path::PathBuf;
 use transcript::{Interner, Session};
@@ -958,12 +958,20 @@ fn cmd_tradeoff(all: &[Session], family: &[u32], max_df: usize, min_gap: usize, 
         return 1;
     }
     let base = billed_cost(&sessions, None);
-    let rows: Vec<(Policy, f64, f64)> = default_policies()
+    let rows: Vec<(Policy, f64, f64, f64)> = default_policies()
         .into_iter()
         .filter_map(|pol| {
             let c = billed_cost(&sessions, Some(pol));
+            let f = refetch_cost(&sessions, &probes, pol);
             let (kept, total) = retention(&sessions, &probes, pol);
-            (total > 0).then(|| (pol, (1.0 - c / base) * 100.0, kept as f64 / total as f64))
+            (total > 0).then(|| {
+                (
+                    pol,
+                    (1.0 - c / base) * 100.0,
+                    (1.0 - (c + f) / base) * 100.0,
+                    kept as f64 / total as f64,
+                )
+            })
         })
         .collect();
     if json {
@@ -971,9 +979,10 @@ fn cmd_tradeoff(all: &[Session], family: &[u32], max_df: usize, min_gap: usize, 
             "sessions": sessions.len(),
             "probes": n,
             "baseline_billed": base,
-            "policies": by_policy(rows.iter().map(|&(pol, saved, r)| {
+            "policies": by_policy(rows.iter().map(|&(pol, saved, refetched, r)| {
                 (pol, serde_json::json!({
                     "cost_saved": saved,
+                    "cost_saved_if_refetched": refetched,
                     "retained": r * 100.0,
                     "lost": (1.0 - r) * 100.0,
                 }))
@@ -988,19 +997,22 @@ fn cmd_tradeoff(all: &[Session], family: &[u32], max_df: usize, min_gap: usize, 
         base
     );
     println!(
-        "{:<20}{:>12}{:>14}{:>14}",
-        "policy", "cost saved", "info retained", "info lost"
+        "{:<20}{:>12}{:>15}{:>14}{:>14}",
+        "policy", "cost saved", "if re-fetched", "info retained", "info lost"
     );
-    for &(pol, saved, r) in &rows {
+    for &(pol, saved, refetched, r) in &rows {
         println!(
-            "{:<20}{:>11.1}%{:>13.1}%{:>13.1}%",
+            "{:<20}{:>11.1}%{:>14.1}%{:>13.1}%{:>13.1}%",
             pol.label(),
             saved,
+            refetched,
             r * 100.0,
             (1.0 - r) * 100.0
         );
     }
-    println!("\nboth columns come from the same policy applied the same way.");
+    println!("\nevery column comes from the same policy applied the same way.");
+    println!("'if re-fetched' adds one request for each lost fact the agent later");
+    println!("reused: what asking for every measured fact back would cost.");
     println!("cost is grounded in real prefix sizes, so the system prompt and tool");
     println!("definitions are carried unchanged: no context policy can touch them.");
     println!("retention measures information survival, not task success.");
