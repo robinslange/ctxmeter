@@ -59,6 +59,7 @@ the savings a compaction tool is selling you have largely been collected.
 |---|---|
 | `summary` | What am I paying for, and how much has caching already saved? |
 | `floor` | How big is my system prompt plus tool definitions, and is it growing? |
+| `invalidation` | When the cache misses, does it lose part of the prefix or all of it? |
 | `probes` | How much later-needed information does each retention policy destroy? |
 | `tradeoff` | What does each policy save, set against what it destroys and what fetching it back costs? |
 | `sensitivity` | Does the policy ranking survive widening the sample? |
@@ -99,6 +100,13 @@ plugins and tool servers accumulate.
 
 Tool definitions never appear in a transcript, so the floor cannot be attributed
 from logs. Change one config item, start a fresh session, and re-run.
+
+**Invalidation.** A turn can re-read at most what the turn before it cached.
+`invalidation` counts a turn as a clean hit when it re-reads at least 98 percent
+of that, and for each miss reports how many tokens dropped out of the cache and
+what share of the prefix that was. A share near 100 percent means a miss throws
+away the whole prefix, which is the all-or-nothing behaviour `robustness` tests
+its cost figures against.
 
 **Retention.** `probes` reports the share of later-needed facts still present
 when the agent reached for them. A probe is a distinctive identifier that a tool

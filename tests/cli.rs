@@ -1,6 +1,7 @@
 use std::process::Command;
 
 const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus");
+const MISSES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/invalidation");
 
 fn ctxmeter(args: &[&str]) -> (i32, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_ctxmeter"))
@@ -34,6 +35,20 @@ fn summary_text_is_unchanged() {
 #[test]
 fn floor_text_is_unchanged() {
     text(&["floor", "--root", CORPUS], "floor", 0);
+}
+
+#[test]
+fn invalidation_text_is_unchanged() {
+    text(&["invalidation", "--root", CORPUS], "invalidation", 0);
+}
+
+#[test]
+fn invalidation_misses_text_is_unchanged() {
+    text(
+        &["invalidation", "--root", MISSES],
+        "invalidation-misses",
+        0,
+    );
 }
 
 #[test]
@@ -142,6 +157,26 @@ fn floor_json() {
         assert_eq!(v[q], 18012, "{q}");
     }
     assert_eq!(v["months"], serde_json::json!({}));
+}
+
+#[test]
+fn invalidation_json() {
+    let v = json(&["invalidation", "--root", CORPUS, "--json"], 0);
+    assert_eq!(v["turns"], 4);
+    assert_eq!(v["write"]["p50"], 900);
+    assert_eq!(v["write"]["p90"], 18000);
+    assert_eq!(v["pairs"], 3);
+    assert_eq!(v["clean"], 3);
+    close(&v["clean_rate"], 100.0, 1e-9);
+    assert_eq!(v["misses"], 0);
+    assert!(v["lost"].is_null());
+
+    let v = json(&["invalidation", "--root", MISSES, "--json"], 0);
+    assert_eq!(v["pairs"], 4);
+    assert_eq!(v["clean"], 2);
+    assert_eq!(v["misses"], 2);
+    assert_eq!(v["lost"]["p50"], 1200);
+    close(&v["lost"]["share_p50"], 100.0, 1e-9);
 }
 
 const POLICIES: [&str; 10] = [

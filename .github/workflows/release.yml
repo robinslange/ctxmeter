@@ -76,8 +76,8 @@ jobs:
             Measure what your coding agent bills you, and what context compaction
             destroys, from transcripts you already have.
 
-            Nothing leaves your machine. `summary`, `floor`, `probes`,
-            `sensitivity`, `tradeoff` and `robustness` make no network calls.
+            Nothing leaves your machine. `summary`, `floor`, `invalidation`,
+            `probes`, `sensitivity`, `tradeoff` and `robustness` make no network calls.
             `counterfactual` does, and needs a real API key plus `--yes`.
 
             Download the archive for your platform, verify the checksum, and run

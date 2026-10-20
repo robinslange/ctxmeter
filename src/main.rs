@@ -40,6 +40,9 @@ enum Cmd {
     Summary,
     /// System prompt plus tool definitions, by month. Re-read every turn.
     Floor,
+    /// Is cache invalidation partial or all-or-nothing? How often a turn re-reads
+    /// what the turn before it cached, and how much a miss loses.
+    Invalidation,
     /// How much later-needed information each retention policy destroys.
     Probes {
         /// A probe token, digits ignored, may appear in the tool results of at most
@@ -297,6 +300,114 @@ fn cmd_floor(sessions: &[Session], json: bool) {
     println!("\nthis is re-read every turn and no proxy can compress it.");
     println!("attribute it by changing config and re-running: tool definitions");
     println!("never appear in a transcript.");
+}
+
+/// Consecutive billed turns within each session. A turn hits cleanly when it
+/// re-reads at least 98% of what the turn before it left cached, read plus
+/// write; otherwise it missed, and the shortfall is what the miss lost.
+struct Invalidation {
+    /// Every turn's incremental cache write, sorted.
+    writes: Vec<u64>,
+    pairs: usize,
+    /// For each miss, the cached prefix before it and the tokens lost from it,
+    /// sorted by loss.
+    misses: Vec<(u64, u64)>,
+}
+
+fn invalidation(sessions: &[Session]) -> Invalidation {
+    let mut writes = Vec::new();
+    let mut pairs = 0;
+    let mut misses = Vec::new();
+    for s in sessions {
+        writes.extend(s.usage.iter().map(|u| u.write));
+        for w in s.usage.windows(2) {
+            let prev = w[0].read + w[0].write;
+            pairs += 1;
+            if w[1].read * 50 < prev * 49 {
+                misses.push((prev, prev - w[1].read));
+            }
+        }
+    }
+    writes.sort_unstable();
+    misses.sort_unstable_by_key(|&(_, lost)| lost);
+    Invalidation {
+        writes,
+        pairs,
+        misses,
+    }
+}
+
+fn cmd_invalidation(sessions: &[Session], json: bool) -> i32 {
+    let inv = invalidation(sessions);
+    if inv.pairs == 0 {
+        let msg = format!(
+            "billed turns {}   consecutive pairs 0\n\nNO PAIRS. A session needs two billed turns before a cache hit can be\njudged, and none here has them.",
+            inv.writes.len()
+        );
+        if json {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+        return 1;
+    }
+    let q = |v: &[u64], p: usize| v[v.len() * p / 100];
+    let clean = inv.pairs - inv.misses.len();
+    let lost: Vec<u64> = inv.misses.iter().map(|&(_, l)| l).collect();
+    let mut share: Vec<f64> = inv
+        .misses
+        .iter()
+        .map(|&(p, l)| l as f64 / p as f64 * 100.0)
+        .collect();
+    share.sort_unstable_by(f64::total_cmp);
+    let qf = |p: usize| share[share.len() * p / 100];
+    if json {
+        emit(serde_json::json!({
+            "turns": inv.writes.len(),
+            "write": {
+                "p50": q(&inv.writes, 50),
+                "p90": q(&inv.writes, 90),
+                "p99": q(&inv.writes, 99),
+            },
+            "pairs": inv.pairs,
+            "clean": clean,
+            "clean_rate": clean as f64 / inv.pairs as f64 * 100.0,
+            "misses": inv.misses.len(),
+            "lost": (!lost.is_empty()).then(|| serde_json::json!({
+                "p50": q(&lost, 50),
+                "p90": q(&lost, 90),
+                "share_p50": qf(50),
+                "share_p90": qf(90),
+            })),
+        }));
+        return 0;
+    }
+    println!("incremental cache write per turn, n={}", inv.writes.len());
+    for p in [50, 90, 99] {
+        println!("  p{p}: {:>10}", q(&inv.writes, p));
+    }
+    println!(
+        "\nclean incremental hits: {clean} of {} ({})",
+        inv.pairs,
+        pct(clean as f64 / inv.pairs as f64)
+    );
+    if lost.is_empty() {
+        println!("no misses: every turn re-read what the turn before it cached.");
+    } else {
+        println!(
+            "when it misses, tokens lost from the cached prefix: p50 {}  p90 {}",
+            q(&lost, 50),
+            q(&lost, 90)
+        );
+        println!(
+            "share of the cached prefix a miss loses: p50 {}  p90 {}",
+            pct(qf(50) / 100.0),
+            pct(qf(90) / 100.0)
+        );
+        println!("\na share near 100% means invalidation is all-or-nothing, which is what");
+        println!("breakpoint-anchored matching with a 20-block lookback predicts.");
+    }
+    0
 }
 
 fn cmd_probes(all: &[Session], family: &[u32], max_df: usize, min_gap: usize, json: bool) -> i32 {
@@ -1171,6 +1282,7 @@ fn main() {
             cmd_floor(&sessions, json);
             0
         }
+        Cmd::Invalidation => cmd_invalidation(&sessions, json),
         Cmd::Probes { max_df, min_gap } => cmd_probes(&sessions, &it.family, max_df, min_gap, json),
         Cmd::Sensitivity => cmd_sensitivity(&sessions, &it.family, json),
         Cmd::Tradeoff { max_df, min_gap } => {
@@ -1215,6 +1327,46 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session(turns: &[(u64, u64)]) -> Session {
+        Session {
+            path: String::new(),
+            msgs: 0,
+            blocks: Vec::new(),
+            turns: Vec::new(),
+            usage: turns
+                .iter()
+                .map(|&(read, write)| transcript::Usage {
+                    ts: String::new(),
+                    model: String::new(),
+                    read,
+                    write,
+                    fresh: 0,
+                    out: 0,
+                })
+                .collect(),
+        }
+    }
+
+    /// The previous turn's read plus write is what the next turn can re-read.
+    /// Re-reading 98% of it is a clean hit; anything below is a miss.
+    #[test]
+    fn a_miss_is_a_read_below_98_percent_of_the_prefix_before_it() {
+        let inv = invalidation(&[session(&[(0, 900), (900, 100), (980, 50), (979, 0)])]);
+        assert_eq!(inv.pairs, 3);
+        assert_eq!(inv.misses, [(1030, 51)]);
+        assert_eq!(inv.writes, [0, 50, 100, 900]);
+    }
+
+    /// Turns pair within a session, never across one, and a one-turn session
+    /// contributes writes but no pair.
+    #[test]
+    fn pairs_never_cross_sessions() {
+        let inv = invalidation(&[session(&[(0, 5000)]), session(&[(0, 10), (0, 10)])]);
+        assert_eq!(inv.pairs, 1);
+        assert_eq!(inv.misses, [(10, 10)]);
+        assert_eq!(inv.writes.len(), 3);
+    }
 
     /// `verdict_doc` renames every field of `Verdict` for the JSON shape; a typo
     /// swapping two of them would compile and pass every existing test, since none
