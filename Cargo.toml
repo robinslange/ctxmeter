@@ -4,6 +4,8 @@ version = "0.1.3"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
+authors = ["omit"]
+repository = "https://github.com/robinslange/ctxmeter"
 description = "Measure what an LLM coding agent actually bills you, and what compaction destroys, from your own transcripts."
 
 [dependencies]
