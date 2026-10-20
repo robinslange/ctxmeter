@@ -1,0 +1,11 @@
+incremental cache write per turn, n=6
+  p50:       1000
+  p90:       2000
+  p99:       2000
+
+clean incremental hits: 2 of 4 (50.00%)
+when it misses, tokens lost from the cached prefix: p50 1200  p90 1200
+share of the cached prefix a miss loses: p50 100.00%  p90 100.00%
+
+a share near 100% means invalidation is all-or-nothing, which is what
+breakpoint-anchored matching with a 20-block lookback predicts.

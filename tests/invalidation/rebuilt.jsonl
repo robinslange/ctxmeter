@@ -1,0 +1,4 @@
+{"requestId": "ar0", "timestamp": "2026-09-01T10:00:00Z", "message": {"id": "am0", "model": "claude-sonnet-5", "usage": {"input_tokens": 10, "cache_creation_input_tokens": 1000, "cache_read_input_tokens": 0, "output_tokens": 20}}}
+{"requestId": "ar1", "timestamp": "2026-09-01T10:00:01Z", "message": {"id": "am1", "model": "claude-sonnet-5", "usage": {"input_tokens": 10, "cache_creation_input_tokens": 200, "cache_read_input_tokens": 1000, "output_tokens": 20}}}
+{"requestId": "ar2", "timestamp": "2026-09-01T10:00:02Z", "message": {"id": "am2", "model": "claude-sonnet-5", "usage": {"input_tokens": 10, "cache_creation_input_tokens": 1300, "cache_read_input_tokens": 0, "output_tokens": 20}}}
+{"requestId": "ar3", "timestamp": "2026-09-01T10:00:03Z", "message": {"id": "am3", "model": "claude-sonnet-5", "usage": {"input_tokens": 10, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 1300, "output_tokens": 20}}}

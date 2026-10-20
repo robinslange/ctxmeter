@@ -1,0 +1,7 @@
+incremental cache write per turn, n=4
+  p50:        900
+  p90:      18000
+  p99:      18000
+
+clean incremental hits: 3 of 3 (100.00%)
+no misses: every turn re-read what the turn before it cached.
