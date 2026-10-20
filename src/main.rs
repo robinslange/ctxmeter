@@ -42,10 +42,12 @@ enum Cmd {
     Floor,
     /// How much later-needed information each retention policy destroys.
     Probes {
-        /// A probe token may appear in at most this many sessions.
+        /// A probe token, digits ignored, may appear in the tool results of at most
+        /// this many sessions.
         #[arg(long, default_value_t = 3)]
         max_df: usize,
-        /// Minimum blocks between a fact being established and reused.
+        /// Minimum blocks between the tool result that establishes a fact and the
+        /// assistant text or tool call that reuses it.
         #[arg(long, default_value_t = 5)]
         min_gap: usize,
     },
@@ -54,8 +56,12 @@ enum Cmd {
     /// Does the conclusion survive its own assumptions? Cache model, estimator
     /// scale, and uncertainty clustered by session.
     Robustness {
+        /// A probe token, digits ignored, may appear in the tool results of at most
+        /// this many sessions.
         #[arg(long, default_value_t = 3)]
         max_df: usize,
+        /// Minimum blocks between the tool result that establishes a fact and the
+        /// assistant text or tool call that reuses it.
         #[arg(long, default_value_t = 5)]
         min_gap: usize,
     },
@@ -96,15 +102,23 @@ enum Cmd {
         /// which every other command deliberately does not.
         #[arg(long)]
         show_raw: bool,
+        /// A probe token, digits ignored, may appear in the tool results of at most
+        /// this many sessions.
         #[arg(long, default_value_t = 3)]
         max_df: usize,
+        /// Minimum blocks between the tool result that establishes a fact and the
+        /// assistant text or tool call that reuses it.
         #[arg(long, default_value_t = 5)]
         min_gap: usize,
     },
     /// What each policy saves against what it destroys. The same knob does both.
     Tradeoff {
+        /// A probe token, digits ignored, may appear in the tool results of at most
+        /// this many sessions.
         #[arg(long, default_value_t = 3)]
         max_df: usize,
+        /// Minimum blocks between the tool result that establishes a fact and the
+        /// assistant text or tool call that reuses it.
         #[arg(long, default_value_t = 5)]
         min_gap: usize,
     },
