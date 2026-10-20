@@ -160,7 +160,6 @@ tool prints probe text.
 Bug reports about the measurement method are more welcome than feature requests.
 If ctxmeter tells you something that looks wrong, that is worth an issue.
 
-`ctxmeter.py` is a reference implementation kept for cross-checking the Rust.
 `cargo test` covers the identifier rules and the token accounting, and pins every
 command's output over the frozen transcripts in `tests/corpus`.
 
